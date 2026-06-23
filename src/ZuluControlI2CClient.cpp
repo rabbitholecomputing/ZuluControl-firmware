@@ -196,6 +196,29 @@ bool EnqueueRequest(uint8_t request, const char* toSend) {
    return true;
 }
 
+bool EnqueueRequestBinary(uint8_t request, const uint8_t* payload, uint16_t length) {
+   if (queue_is_full(&outputQueue))
+   {
+      EnqueueRequest(I2C_CLIENT_RESET_QUEUE);
+   }
+   if (length > MAX_MSG_SIZE) length = MAX_MSG_SIZE;
+   Packet* p = new Packet();
+   p->command = request;
+   p->length = length;
+   p->lengthBytes[0] = p->length >> 8;
+   p->lengthBytes[1] = p->length;
+   p->pos = 0;
+   p->state = SendState::None;
+   if (length > 0 && payload != nullptr) {
+      memcpy(p->buffer, payload, length);
+   }
+   if (!queue_try_add(&outputQueue, &p)) {
+      delete p;
+      return false;
+   }
+   return true;
+}
+
 
 
 void Init(uint sdaPin, uint sclPin, uint addr, uint baudrate) {
@@ -268,6 +291,10 @@ void ProcessMessages() {
          ProcessStaticIP(toRecv->buffer, toRecv->length);
       } else if (Is(toRecv, I2C_SERVER_IP_ADDRESS_ACK)) {
          ProcessIPAddressAck();
+      } else if (Is(toRecv, I2C_SERVER_DEVICE_LIST_JSON)) {
+         ProcessDeviceList(toRecv->buffer, toRecv->length);
+      } else if (Is(toRecv, I2C_SERVER_SD_STATUS_CHANGE)) {
+         ProcessSDStatus(toRecv->buffer, toRecv->length);
       }
 
 

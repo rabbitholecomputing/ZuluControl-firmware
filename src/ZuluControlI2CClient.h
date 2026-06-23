@@ -22,7 +22,7 @@
 #ifndef ZULU_CONTROL_I2C_CLIENT
 #define ZULU_CONTROL_I2C_CLIENT
 
-#define I2C_API_VERSION "3.2.2"
+#define I2C_API_VERSION "4.0.0"
 
 #ifndef FW_GITHASH
 #define FW_GITHASH ""
@@ -46,6 +46,11 @@
 #define I2C_SERVER_RESET 0xF
 #define I2C_SERVER_STATIC_IP 0x10
 #define I2C_SERVER_IP_ADDRESS_ACK 0x11
+#define I2C_SERVER_DEVICE_LIST_JSON 0x12   // ZuluSCSI: JSON array of removable device descriptors
+#define I2C_SERVER_SD_STATUS_CHANGE 0x13   // SD card presence changed; payload[0] = 0x00 not present, 0x01 present
+
+#define I2C_SERVER_SD_NOT_PRESENT 0x00
+#define I2C_SERVER_SD_PRESENT     0x01
 
 #define I2C_CLIENT_NOOP 0x0
 #define I2C_CLIENT_API_VERSION 0x01
@@ -59,6 +64,8 @@
 #define I2C_CLIENT_FETCH_ITR_IMAGE 0x10
 #define I2C_CLIENT_IP_ADDRESS 0x11
 #define I2C_CLIENT_LOG_MSG 0x12
+#define I2C_CLIENT_FETCH_DEVICE_LIST 0x13  // ZuluSCSI: request list of removable SCSI devices
+#define I2C_CLIENT_INSERT_MEDIA 0x14        // ZuluSCSI: close tray / insert media; payload[0]=scsi_id
 #define I2C_CLIENT_RESET_QUEUE 0xFF
 
 #ifndef I2C_CMD_RETRY_MS
@@ -105,6 +112,11 @@ bool EnqueueRequest(uint8_t request);
    Enqueues a request to send to the I2C server with the provided string argument.
  */
 bool EnqueueRequest(uint8_t request, const char* toSend);
+
+/**
+   Enqueues a request with a raw binary payload (used for ZuluSCSI scsi_id-prefixed commands).
+ */
+bool EnqueueRequestBinary(uint8_t request, const uint8_t* payload, uint16_t length);
 
 /**
    Resets the request queue
@@ -168,6 +180,16 @@ void ProcessStaticIP(const uint8_t* message, size_t length);
    Called when server acknowledges receipt of the clients IP address
  */
 void ProcessIPAddressAck();
+
+/**
+   Called when the server sends the JSON list of removable SCSI devices (ZuluSCSI only).
+ */
+void ProcessDeviceList(const uint8_t* message, size_t length);
+
+/**
+   Called when the server reports an SD card presence change.
+ */
+void ProcessSDStatus(const uint8_t* message, size_t length);
 
 /**
    Configures the I2C communication parameters.

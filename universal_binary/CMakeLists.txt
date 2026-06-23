@@ -1,4 +1,4 @@
-# This builds an universal binary that works for both PicoW and Pico2W.
+# This builds an universal binary that works for both Pico W and Pico 2W.
 # During development you can use individual builds by defining PICO_BOARD
 # for the root folder CMakeLists.txt:
 #
@@ -10,7 +10,7 @@
 # cmake -B build; cmake --build build
 
 cmake_minimum_required(VERSION 3.25)
-project(zuluide_http_picow_universal C CXX ASM)
+project(zulucontrol_universal C CXX ASM)
 include(ExternalProject)
 
 ExternalProject_Add(platform_picow
@@ -38,9 +38,9 @@ ExternalProject_Add(platform_pico2w
 # Instead, arrange the combined UF2 like this:
 # [All except last block of RP2040] [All of RP2350] [Last block of RP2040]
 
-set(RP2040_UF2 ${CMAKE_CURRENT_BINARY_DIR}/platform_picow/zuluide_http_picow.uf2)
-set(RP2040_UF2_PART1 ${CMAKE_CURRENT_BINARY_DIR}/platform_picow/zuluide_http_picow_part1.uf2)
-set(RP2040_UF2_PART2 ${CMAKE_CURRENT_BINARY_DIR}/platform_picow/zuluide_http_picow_part2.uf2)
+set(RP2040_UF2 ${CMAKE_CURRENT_BINARY_DIR}/platform_picow/zulucontrol.uf2)
+set(RP2040_UF2_PART1 ${CMAKE_CURRENT_BINARY_DIR}/platform_picow/zulucontrol_part1.uf2)
+set(RP2040_UF2_PART2 ${CMAKE_CURRENT_BINARY_DIR}/platform_picow/zulucontrol_part2.uf2)
 set(SPLIT_UF2_PY ${CMAKE_CURRENT_SOURCE_DIR}/split_uf2.py)
 
 add_custom_command(
@@ -53,10 +53,10 @@ add_custom_command(
 
 set(PLATFORM_UF2s
     ${RP2040_UF2_PART1}
-    ${CMAKE_CURRENT_BINARY_DIR}/platform_pico2w/zuluide_http_picow.uf2
+    ${CMAKE_CURRENT_BINARY_DIR}/platform_pico2w/zulucontrol.uf2
     ${RP2040_UF2_PART2}
 )
-set(COMBINED_UF2 zuluide_http_picow.uf2)
+set(COMBINED_UF2 zulucontrol.uf2)
 
 add_custom_command(
     OUTPUT ${COMBINED_UF2}

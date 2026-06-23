@@ -20,34 +20,34 @@ endif()
 
 include(pico_sdk_import.cmake)
 
-project(zuluide_http_picow C CXX ASM)
+project(zulucontrol C CXX ASM)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 
 pico_sdk_init()
 
-add_executable(zuluide_http_picow)
+add_executable(zulucontrol)
 
-target_sources(zuluide_http_picow PRIVATE
+target_sources(zulucontrol PRIVATE
     src/main.cpp
     src/url_decode.cpp
     src/ZuluControlI2CClient.cpp
     src/fw_upgrade.cpp
 )
 
-#pico_enable_stdio_uart(zuluide_http_picow ENABLED)
-pico_enable_stdio_usb(zuluide_http_picow ENABLED)
+#pico_enable_stdio_uart(zulucontrol ENABLED)
+pico_enable_stdio_usb(zulucontrol ENABLED)
 
-add_dependencies(zuluide_http_picow pico_i2c_slave pico_multicore)
+add_dependencies(zulucontrol pico_i2c_slave pico_multicore)
 
-pico_add_extra_outputs(zuluide_http_picow)
+pico_add_extra_outputs(zulucontrol)
 
-target_compile_options(zuluide_http_picow PRIVATE -Wall)
+target_compile_options(zulucontrol PRIVATE -Wall)
 
-target_link_options(zuluide_http_picow PRIVATE "-Wl,--print-memory-usage")
+target_link_options(zulucontrol PRIVATE "-Wl,--print-memory-usage")
 
-target_include_directories(zuluide_http_picow PRIVATE
+target_include_directories(zulucontrol PRIVATE
         ${CMAKE_CURRENT_LIST_DIR}/src
         )
 
@@ -88,12 +88,12 @@ if(GIT_RESULT EQUAL 0)
 endif()
 
 
-target_compile_definitions(zuluide_http_picow PRIVATE
+target_compile_definitions(zulucontrol PRIVATE
         WIFI_PASSWORD=\"${WIFI_PASSWORD}\"
         WIFI_SSID=\"${WIFI_SSID}\"
         )
 
-target_link_libraries(zuluide_http_picow
+target_link_libraries(zulucontrol
         pico_i2c_slave
         pico_multicore
         pico_stdlib

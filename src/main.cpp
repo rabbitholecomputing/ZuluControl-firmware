@@ -12,11 +12,11 @@
  *
  * This program is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
  *
  * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  **/
 
 #include <hardware/watchdog.h>
@@ -47,520 +47,689 @@
 #include "url_decode.h"
 
 static const uint I2C_SLAVE_ADDRESS = 0x45;
-static const uint I2C_BAUDRATE = 400000;  // 100 kHz
+static const uint I2C_BAUDRATE = 400000;  // 400 kHz
 
-static const uint I2C_SLAVE_SDA_PIN = 0;  // PICO_DEFAULT_I2C_SDA_PIN; // 4
-static const uint I2C_SLAVE_SCL_PIN = 1;  // PICO_DEFAULT_I2C_SCL_PIN; // 5
+static const uint I2C_SLAVE_SDA_PIN = 0;
+static const uint I2C_SLAVE_SCL_PIN = 1;
 
-static const uint8_t GPIO_BOARD_TYPE = 5; // Determins if the shield is using a Pico or a laid down RP2040
+static const uint8_t GPIO_BOARD_TYPE = 5;
 static const uint8_t GPIO_MCU_LED    = 26;
 
-// Board type A uses a Pico W with minimal GPIO break out
-// Board type B uses a laid down RP2040 with GPIO break out
+static const uint8_t MAX_SCSI_IDS = 16;
+
 static bool g_board_type_b = false;
 
-enum class FilenameCacheState { Idle, Start, Fetching, Full, Overflow};
+// ── Device type / SD status ───────────────────────────────────────────────────
 
-enum class ImageCacheState { Idle,
-                             Fetching,
-                             Full,
-                             Iterating,
-                             IteratingFinished };
+enum class DeviceType { Unknown, ZuluIDE, ZuluSCSI };
+static DeviceType g_device_type = DeviceType::Unknown;
+static bool g_sd_present = false;
 
-enum class IPAddressState { Init, Sending, Received};
+// ── Filename cache ────────────────────────────────────────────────────────────
+
+enum class FilenameCacheState { Idle, Start, Fetching, Full, Overflow };
+
+// Single backing buffer for all filename JSON strings.
+static char filenames_json[FILENAMES_JSON_CACHE_SIZE] = {0};
+// Per-SCSI-ID pointers into filenames_json; NULL means that ID is not cached.
+// ZuluIDE always uses index 0.  All-or-nothing: if g_filenames_overflow is true
+// the cache is invalid for every ID regardless of whether its pointer is set.
+static char *g_filenames_scsi_id[MAX_SCSI_IDS] = {nullptr};
+// Next free byte in filenames_json for the current write pass.
+static char *g_filenames_write_ptr = filenames_json;
+// Start of the JSON segment being built for g_filenames_active_id.
+static char *g_filenames_id_start = nullptr;
+// True if any ID overflowed the buffer; the entire cache is a miss when set.
+static bool  g_filenames_overflow = false;
+// SCSI ID currently being received (0xFF = none in progress).
+static uint8_t g_filenames_active_id = 0xFF;
+// SCSI ID whose pointer to serve for the next /filenames.json response.
+static uint8_t g_filenames_serving_id = 0xFF;
 
 static volatile FilenameCacheState filenameState = FilenameCacheState::Idle;
 
-static char filenames_json[FILENAMES_JSON_CACHE_SIZE] = {0};
+// ── Image/iterator cache ──────────────────────────────────────────────────────
+
+enum class ImageCacheState { Idle, Fetching, Full, Iterating, IteratingFinished };
 
 static volatile ImageCacheState imageState = ImageCacheState::Idle;
+static queue_t imageQueue;
+static std::vector<char *> images;
+static char *imageJson = NULL;
 
+// ── Device list (ZuluSCSI) ────────────────────────────────────────────────────
+
+static char deviceListJson[MAX_MSG_SIZE] = {0};
+
+// ── IP / WiFi ─────────────────────────────────────────────────────────────────
+
+enum class IPAddressState { Init, Sending, Received };
 static volatile IPAddressState ipAddrState = IPAddressState::Init;
 
 bool static_ip_set = false;
-
 static ip4_addr_t static_ip, static_gw, static_netmask;
-
-
 char ipBuffer[32] = {0};
 
-static char versionJson[MAX_MSG_SIZE];
+// ── Status / version JSON buffers ─────────────────────────────────────────────
 
+static char versionJson[MAX_MSG_SIZE];
 static char currentStatus[MAX_MSG_SIZE];
 
-static queue_t imageQueue;
-
-static std::vector<char *> images;
-
-static char *imageJson = NULL;
+// ── WiFi credentials ──────────────────────────────────────────────────────────
 
 static std::string wifiPass;
-
 static bool wifiPassSet = false;
-
 static std::string wifiSSID;
-
 static std::string serverAPIVersion;
 
-enum class State { 
-                   Unknown,
-                   WaitForAPIVersion,
-                   WaitingForSSID,
-                   WaitingForPassword,
-                   WaitingForConnect,
-                   WIFIInit,
-                   WIFIDown,
-                   Normal };
+// ── State machine ─────────────────────────────────────────────────────────────
+
+enum class State {
+    Unknown,
+    WaitForAPIVersion,
+    WaitingForSSID,
+    WaitingForPassword,
+    WaitingForConnect,
+    WIFIInit,
+    WIFIDown,
+    Normal
+};
 
 namespace ClientMessage {
-   namespace Prefix
-   {
-      constexpr char Normal  = 'n';
-      constexpr char Debug   = 'd';
-      constexpr char Unknown = 'u';
-   }
-   enum class Type {
-                     Normal,
-                     Debug
-   };
+    namespace Prefix {
+        constexpr char Normal  = 'n';
+        constexpr char Debug   = 'd';
+        constexpr char Unknown = 'u';
+    }
+    enum class Type { Normal, Debug };
 }
+
 static State programState = State::WaitForAPIVersion;
-
-
 
 void RebuildImageJson();
 
 static uint32_t millis() {
-   return to_ms_since_boot(get_absolute_time());
+    return to_ms_since_boot(get_absolute_time());
 }
 
-/**
- * Resets the client state, including clearing the output queue and any stored static IP information.
- */
 static void reset() {
-   zuluide::i2c::client::EnqueueRequest(I2C_CLIENT_RESET_QUEUE);
-   static_ip_set = false;
-   memset(&static_ip, 0, sizeof(static_ip));
-   memset(&static_netmask, 0, sizeof(static_netmask));
-   memset(&static_gw, 0, sizeof(static_gw));
+    zuluide::i2c::client::EnqueueRequest(I2C_CLIENT_RESET_QUEUE);
+    static_ip_set = false;
+    memset(&static_ip, 0, sizeof(static_ip));
+    memset(&static_netmask, 0, sizeof(static_netmask));
+    memset(&static_gw, 0, sizeof(static_gw));
 }
+
+// ── I2C callback implementations ─────────────────────────────────────────────
 
 namespace zuluide::i2c::client {
 
-   /**
- * Send message to i2c server to log
- */
 void LogMessageToServer(ClientMessage::Type type, const char* format, ...)
 {
-   // Prepend a character to indicate the type of message being sent.
-   char prefix  = ClientMessage::Prefix::Unknown;
-   switch(type)
-   {
-      case ClientMessage::Type::Normal:
-         prefix = ClientMessage::Prefix::Normal;
-         break;
-      case ClientMessage::Type::Debug:
-         prefix = ClientMessage::Prefix::Debug;
-         break;
-      default:
-         prefix = ClientMessage::Prefix::Unknown;
-   }
-   // Minimize the size need to store format with the prefix in message.
-   size_t format_len = strlen(format);
-   if (format_len > MAX_MSG_SIZE - 2) {
-      format_len = MAX_MSG_SIZE - 2;
-   }
-   char *message = new char[format_len + 2];
-   memset(message, '\0', format_len + 2);
-   message[0] = prefix;
-   strncpy(message + 1, format, format_len);
+    char prefix = ClientMessage::Prefix::Unknown;
+    switch (type) {
+        case ClientMessage::Type::Normal: prefix = ClientMessage::Prefix::Normal; break;
+        case ClientMessage::Type::Debug:  prefix = ClientMessage::Prefix::Debug;  break;
+        default: break;
+    }
+    size_t format_len = strlen(format);
+    if (format_len > MAX_MSG_SIZE - 2) format_len = MAX_MSG_SIZE - 2;
+    char *message = new char[format_len + 2];
+    memset(message, '\0', format_len + 2);
+    message[0] = prefix;
+    strncpy(message + 1, format, format_len);
 
-   // Use printf formatting to build payload message, then send to server and print to console.
-   char payload[MAX_MSG_SIZE] = {0};
-   va_list args;
-   va_start(args, format);
-   vsnprintf(payload, sizeof(payload), message, args);
-   va_end(args);
-   printf("%s\n", payload + 1);
-   zuluide::i2c::client::EnqueueRequest(I2C_CLIENT_LOG_MSG, payload);
-   delete[] message;
+    char payload[MAX_MSG_SIZE] = {0};
+    va_list args;
+    va_start(args, format);
+    vsnprintf(payload, sizeof(payload), message, args);
+    va_end(args);
+    printf("%s\n", payload + 1);
+    zuluide::i2c::client::EnqueueRequest(I2C_CLIENT_LOG_MSG, payload);
+    delete[] message;
 }
 
-/**
-   Callback function for receiving I2C Server API version string.
- */
+void ProcessServerAPIVersion(const uint8_t *message, size_t length)
+{
+    memset(versionJson, '\0', sizeof(versionJson));
+    strcat(versionJson, "{\"clientAPIVersion\":\"");
+    strcat(versionJson, I2C_API_VERSION);
+    strcat(versionJson, "\"");
+    printf("Client API version: v%s\n", I2C_API_VERSION);
 
-void  ProcessServerAPIVersion(const uint8_t *message, size_t length) {
-   memset(versionJson, '\0', sizeof(versionJson));
-   strcat(versionJson, "{\"clientAPIVersion\":\"");
-   strcat(versionJson, I2C_API_VERSION);
-   strcat(versionJson, "\"");
-   printf("Client API version: v%s\n", I2C_API_VERSION );
-   bool matching_major_version = false;
-   unsigned long server_major_version = 0;
-   unsigned long client_major_version = 0;
-   char* period_location = strchr(I2C_API_VERSION, '.');
-   client_major_version = strtoul(I2C_API_VERSION, &period_location, 10);
+    strcat(versionJson, ", \"clientFWVersion\":\"");
+    strcat(versionJson, FW_VERSION);
+    strcat(versionJson, "\"");
 
-   strcat(versionJson, ", \"clientFWVersion\":\"");
-   strcat(versionJson, FW_VERSION);
-   strcat(versionJson, "\"");
+    bool matching_major_version = false;
+    unsigned long server_major_version = 0;
+    unsigned long client_major_version = 0;
+    char* period_location = strchr(I2C_API_VERSION, '.');
+    client_major_version = strtoul(I2C_API_VERSION, &period_location, 10);
 
-   if (length > 0)
-   {
-      serverAPIVersion = std::string((const char*)message);
-      strcat(versionJson, ", \"serverAPIVersion\":\"");
-      strcat(versionJson, (const char*)message);
-      strcat(versionJson, "\"");
-      printf("Server API version: v%s\n", message);
+    // Detect device type from version string: "4.0.0 ZuluSCSI" or "4.0.0 ZuluIDE"
+    const char *device_name = "ZuluIDE";  // default for backwards compatibility
+    if (length > 0) {
+        serverAPIVersion = std::string((const char*)message, length);
+        strcat(versionJson, ", \"serverAPIVersion\":\"");
+        strncat(versionJson, (const char*)message, length < MAX_MSG_SIZE - 100 ? length : MAX_MSG_SIZE - 100);
+        strcat(versionJson, "\"");
+        printf("Server API version: v%s\n", serverAPIVersion.c_str());
 
-      period_location = strchr((const char*)message, '.');
-      if (period_location != NULL)
-      {
-         server_major_version = strtoul((const char*)message, &period_location, 10);
-         if (period_location != NULL)
-         {
-            if (client_major_version > 0 && client_major_version == server_major_version)
-            {
-               matching_major_version = true;
+        // Parse major version (strtoul stops at non-digit, space, or dot)
+        period_location = strchr((const char*)message, '.');
+        if (period_location != NULL) {
+            server_major_version = strtoul((const char*)message, &period_location, 10);
+            if (server_major_version > 0 && server_major_version == client_major_version) {
+                matching_major_version = true;
             }
-         }
-      }
-      
-   }
-   else
-   {
-      strcat(versionJson, ", \"serverAPIVersion\":\"Unknown\"");
-      printf("Error: no API version received from server\n");
-   }
+        }
 
-   if (!matching_major_version)
-   {
-      strcat(versionJson, ", \"message\":\"API major version mismatch. Please update both devices to the latest firmware. <br/> <a href='https://github.com/ZuluIDE/ZuluIDE-firmware/releases'>ZuluIDE firmware</a><br /><a href='https://github.com/ZuluIDE/ZuluIDE-HTTP-PicoW/releases'>ZuluIDE-HTTP-PicoW firmware</a>\"");
-      printf("Warning: major versions between client and sever do not match. Please upgrade both devices to the latest firmware\n");
-      printf("https://github.com/ZuluIDE/ZuluIDE-HTTP-PicoW/releases\n");
-      printf("https://github.com/ZuluIDE/ZuluIDE-firmware/releases\n");
-   }
+        // Parse device name from after the first space
+        const char *space = (const char *)memchr(message, ' ', length);
+        if (space != NULL && (space + 1) < ((const char*)message + length)) {
+            const char *parsed_name = space + 1;
+            size_t name_len = length - (size_t)(parsed_name - (const char*)message);
+            if (name_len >= 7 && strncmp(parsed_name, "ZuluSCSI", 8) == 0) {
+                device_name = "ZuluSCSI";
+                g_device_type = DeviceType::ZuluSCSI;
+                printf("Detected device: ZuluSCSI\n");
+            } else if (name_len >= 7 && strncmp(parsed_name, "ZuluIDE", 7) == 0) {
+                device_name = "ZuluIDE";
+                g_device_type = DeviceType::ZuluIDE;
+                printf("Detected device: ZuluIDE\n");
+            }
+        } else {
+            // No device name - old firmware, assume ZuluIDE
+            g_device_type = DeviceType::ZuluIDE;
+            printf("No device name in version string, assuming ZuluIDE\n");
+        }
+    } else {
+        strcat(versionJson, ", \"serverAPIVersion\":\"Unknown\"");
+        printf("Error: no API version received from server\n");
+        g_device_type = DeviceType::ZuluIDE;
+    }
 
-   strcat(versionJson, "}");
-   // Clear unhandled request retries
-   EnqueueRequest(I2C_CLIENT_RESET_QUEUE);
-   programState = State::WaitingForSSID;
+    strcat(versionJson, ", \"deviceType\":\"");
+    strcat(versionJson, device_name);
+    strcat(versionJson, "\"");
+
+    if (!matching_major_version) {
+        strcat(versionJson, ", \"message\":\"API major version mismatch. Please update both devices to the latest firmware. "
+            "<br/> <a href='https://github.com/ZuluIDE/ZuluIDE-HTTP-PicoW/releases'>ZuluControl firmware</a>\"");
+        printf("Warning: major versions between client and server do not match. Please upgrade both devices.\n");
+    }
+
+    strcat(versionJson, "}");
+    EnqueueRequest(I2C_CLIENT_RESET_QUEUE);
+    if (g_device_type == DeviceType::ZuluSCSI) {
+        EnqueueRequest(I2C_CLIENT_API_VERSION, I2C_API_VERSION);
+    }
+    programState = State::WaitingForSSID;
 }
 
 void ProcessWiFiConnect()
 {
-   printf("Wifi Connect Received\n");
-   programState = State::WIFIInit;
+    printf("Wifi Connect Received\n");
+    programState = State::WIFIInit;
 }
 
-/**
-   Callback function for receiving system status that copies the status
-   into a local buffer for use by the web server.
- */
-void ProcessSystemStatus(const uint8_t *message, size_t length) {
-   memset(currentStatus, 0, MAX_MSG_SIZE);
-   memcpy(currentStatus, message, MAX_MSG_SIZE);
+void ProcessSystemStatus(const uint8_t *message, size_t length)
+{
+    memset(currentStatus, 0, MAX_MSG_SIZE);
+    memcpy(currentStatus, message, length < MAX_MSG_SIZE ? length : MAX_MSG_SIZE - 1);
 }
 
-void ProcessUpdateFilenames(const uint8_t *message, size_t length) {
-   printf("Begining filename cache update process\n");
-   filenameState = FilenameCacheState::Start;
+void ProcessUpdateFilenames(const uint8_t *message, size_t length)
+{
+    uint8_t incoming_id = 0;  // ZuluIDE always uses slot 0
+    if (g_device_type == DeviceType::ZuluSCSI) {
+        incoming_id = (length > 0) ? message[0] : 0xFF;
+        if (incoming_id >= MAX_SCSI_IDS) {
+            printf("Ignoring filename cache update for invalid SCSI ID %u\n", incoming_id);
+            return;
+        }
+    }
+
+    // Reset the entire buffer only after an overflow.  A cached-ID update (e.g.
+    // a FETCH response arriving after the subscribe push already populated the
+    // cache) must NOT reset other IDs' pointers; new data is simply appended
+    // after the current write pointer and the pointer for incoming_id is
+    // updated.  This prevents a narrow race where a browser request between two
+    // consecutive subscribe-push segments triggers a FETCH that later resets
+    // the whole buffer.
+    if (g_filenames_overflow) {
+        printf("Resetting filename buffer after overflow\n");
+        memset(filenames_json, 0, sizeof(filenames_json));
+        for (int i = 0; i < MAX_SCSI_IDS; i++) g_filenames_scsi_id[i] = nullptr;
+        g_filenames_write_ptr = filenames_json;
+        g_filenames_overflow = false;
+    }
+
+    printf("Beginning filename cache update for %s ID %u\n",
+           g_device_type == DeviceType::ZuluSCSI ? "SCSI" : "IDE", incoming_id);
+    g_filenames_active_id = incoming_id;
+    g_filenames_id_start   = g_filenames_write_ptr;
+    filenameState = FilenameCacheState::Start;
 }
 
-/**
-   Callback function for receiving a filename from the I2C server.
-   It adds the filename to JSON file cached in SRAM.
- */
-void ProcessFilename(const uint8_t *message, size_t length) {
-   const size_t cache_size = sizeof(filenames_json);
-   printf("Process filename length: %d\n", length);
-   if (filenameState == FilenameCacheState::Start) {
-      memset(filenames_json, '\0', cache_size);
-      if (cache_size < sizeof("{\"filenames\":[")) {
-         printf("Filename cache overflowed after init, increase cache size\n");
-         filenameState = FilenameCacheState::Overflow;
-         return;
-      } else {
-         strcat(filenames_json, "{\"filenames\":[");
-      }
-   }
+void ProcessFilename(const uint8_t *message, size_t length)
+{
+    const uint8_t *data = message;
+    size_t data_len = length;
 
-   if (length > 0) {
-      if (filenameState == FilenameCacheState::Start)
-      {
-         if (strlen(filenames_json) + strlen("\"") + length + strlen("\"") + 1 > cache_size) {
-            printf("Filename cache overflowed adding the first filename JSON cache\n");
+    if (g_device_type == DeviceType::ZuluSCSI) {
+        if (length == 0) {
+            // fall through - end sentinel for the active ID
+        } else {
+            uint8_t incoming_id = message[0];
+            if (incoming_id != g_filenames_active_id) return;
+            data = message + 1;
+            data_len = length - 1;
+        }
+    }
+
+    if (g_filenames_active_id >= MAX_SCSI_IDS) return;
+    // Discard incoming data once an overflow has been flagged; the next
+    // ProcessUpdateFilenames call will reset the buffer.
+    if (g_filenames_overflow) return;
+
+    char *buf_end = filenames_json + FILENAMES_JSON_CACHE_SIZE;
+    printf("Process filename length: %zu\n", data_len);
+
+    // Write the opening JSON header on the first call for this ID.
+    if (filenameState == FilenameCacheState::Start) {
+        const char *hdr = "{\"filenames\":[";
+        size_t hdr_len = strlen(hdr);
+        // Reserve space for the minimum closing ]}NUL as well.
+        if (g_filenames_write_ptr + hdr_len + 3 > buf_end) {
+            printf("Filename cache overflowed after init\n");
+            g_filenames_overflow = true;
             filenameState = FilenameCacheState::Overflow;
             return;
-         }
-         strcat(filenames_json, "\"");
-         memcpy(filenames_json + strlen(filenames_json), message, length);
-         strcat(filenames_json, "\"");
-         filenameState = FilenameCacheState::Fetching;
-      } else if (filenameState == FilenameCacheState::Fetching) {
-         if (strlen(filenames_json) + strlen(",\"") + length + strlen("\"") + 1 > cache_size) {
-            printf("Filename cache overflowed adding a filename JSON cache\n");
+        }
+        memcpy(g_filenames_write_ptr, hdr, hdr_len);
+        g_filenames_write_ptr += hdr_len;
+    }
+
+    if (data_len > 0) {
+        bool first = (filenameState == FilenameCacheState::Start);
+        // Space needed: optional comma, opening quote, data, closing quote, then ]}NUL at minimum.
+        size_t needed = (first ? 1 : 2) + data_len + 1 + 3;
+        if (g_filenames_write_ptr + needed > buf_end) {
+            printf("Filename cache overflowed\n");
+            g_filenames_overflow = true;
             filenameState = FilenameCacheState::Overflow;
             return;
-         }
-         strcat(filenames_json, ",\"");
-         memcpy(filenames_json + strlen(filenames_json), message, length);
-         strcat(filenames_json, "\"");
-      }
-   } else {
-      if (filenameState == FilenameCacheState::Start || filenameState == FilenameCacheState::Fetching)
-      {
-         if (strlen(filenames_json) + strlen("]}") + 1 > cache_size) {
-            printf("Filename cache overflowed adding closing characters\n");
-            filenameState = FilenameCacheState::Overflow;
-         } else {
-            printf("Received filename of length zero, setting state to Full\n");
-            // All images received.
-            strcat(filenames_json, "]}");
-            filenameState = FilenameCacheState::Full;
-         }
-      }
-   }
+        }
+        if (!first) *g_filenames_write_ptr++ = ',';
+        *g_filenames_write_ptr++ = '"';
+        memcpy(g_filenames_write_ptr, data, data_len);
+        g_filenames_write_ptr += data_len;
+        *g_filenames_write_ptr++ = '"';
+        filenameState = FilenameCacheState::Fetching;
+    } else {
+        // End of list sentinel
+        if (filenameState == FilenameCacheState::Start || filenameState == FilenameCacheState::Fetching) {
+            if (g_filenames_write_ptr + 3 > buf_end) {
+                printf("Filename cache overflowed at closing\n");
+                g_filenames_overflow = true;
+                filenameState = FilenameCacheState::Overflow;
+                return;
+            }
+            *g_filenames_write_ptr++ = ']';
+            *g_filenames_write_ptr++ = '}';
+            *g_filenames_write_ptr++ = '\0';
+
+            g_filenames_scsi_id[g_filenames_active_id] = g_filenames_id_start;
+
+            if (g_device_type == DeviceType::ZuluSCSI) {
+                printf("Cached filenames for SCSI ID %u\n", g_filenames_active_id);
+                g_filenames_active_id = 0xFF;
+                filenameState = FilenameCacheState::Idle;
+            } else {
+                printf("Received filename of length zero, setting state to Full\n");
+                filenameState = FilenameCacheState::Full;
+            }
+        }
+    }
 }
 
-/**
-   Callback function fo receiving an image from the I2C server.
-   If the web service is iterating, the image is cached for the
-   next iterate request from the web server client. If the
-   web service is retrieving all fo the images, it is cached in a
-   vector until all are received and a single JSON document
-   is built for all of the images.
- */
-void ProcessImage(const uint8_t *message, size_t length) {
-   if (length > 0) {
-      char *image = new char[length + 1];
-      memset(image, 0, length + 1);
-      memcpy(image, message, length);
-      if (imageState == ImageCacheState::Iterating) {
-         queue_try_add(&imageQueue, &image);
-      } else {
-         images.push_back(image);
-      }
-   } else {
-      if (imageState == ImageCacheState::Iterating) {
-         imageState = ImageCacheState::IteratingFinished;
-      } else {
-         // Rebuild the image.
-         RebuildImageJson();
+void ProcessImage(const uint8_t *message, size_t length)
+{
+    const uint8_t *data = message;
+    size_t data_len = length;
 
-         // All images received.
-         imageState = ImageCacheState::Full;
-      }
-   }
+    if (g_device_type == DeviceType::ZuluSCSI && length > 0) {
+        // ZuluSCSI payload: [scsi_id][json...]; end sentinel is just [scsi_id] (data_len==0)
+        data = message + 1;
+        data_len = length - 1;
+    }
+
+    if (data_len > 0) {
+        char *image = new char[data_len + 1];
+        memset(image, 0, data_len + 1);
+        memcpy(image, data, data_len);
+        if (imageState == ImageCacheState::Iterating) {
+            queue_try_add(&imageQueue, &image);
+        } else {
+            images.push_back(image);
+        }
+    } else {
+        if (imageState == ImageCacheState::Iterating) {
+            imageState = ImageCacheState::IteratingFinished;
+        } else {
+            RebuildImageJson();
+            imageState = ImageCacheState::Full;
+        }
+    }
 }
 
-/**
-   Handles retreiving the SSID from the server. If one is not provided
-   then a compiled constant is used (if avaialble).
- */
-void ProcessSSID(const uint8_t *message, size_t length) {
-   if (length > 0) {
-      wifiSSID = std::string((const char *)message);
-      printf("Using WIFI SSID (%s) from the server.\n", wifiSSID.c_str());
-   } else if (strlen(WIFI_SSID) > 0) {
-      wifiSSID = std::string(WIFI_SSID);
-      printf("Using WIFI SSID (%s) compiled into the application.\n", wifiSSID.c_str());
-   } else {
-      printf("No WIFI SSID retrieved from server and none compiled into the application.\n");
-      return;
-   }
-
-   // Clear retries
-   EnqueueRequest(I2C_CLIENT_RESET_QUEUE);
-   programState = State::WaitingForPassword;
+void ProcessSSID(const uint8_t *message, size_t length)
+{
+    if (length > 0) {
+        wifiSSID = std::string((const char *)message, length);
+        printf("Using WIFI SSID (%s) from the server.\n", wifiSSID.c_str());
+    } else if (strlen(WIFI_SSID) > 0) {
+        wifiSSID = std::string(WIFI_SSID);
+        printf("Using WIFI SSID (%s) compiled into the application.\n", wifiSSID.c_str());
+    } else {
+        printf("No WIFI SSID retrieved from server and none compiled into the application.\n");
+        return;
+    }
+    EnqueueRequest(I2C_CLIENT_RESET_QUEUE);
+    programState = State::WaitingForPassword;
 }
 
-/**
-   Handles retrieving the wifi password from the server. If one is not provided
-   then a compiled constant is used (if available). If a password is not provided
-   then it is assumed to be an open network.
- */
-void ProcessPassword(const uint8_t *message, size_t length) {
-   if (length > 0) {
-      printf("Using WIFI password from the server.\n");
-   } else {
-      printf("WiFi password cleared, assuming open WiFi network.\n");
-   }
-   wifiPass = std::string((const char *)message);
-   wifiPassSet = true;
-   // Clear retries
-   EnqueueRequest(I2C_CLIENT_RESET_QUEUE);
-   programState = State::WaitingForConnect;
+void ProcessPassword(const uint8_t *message, size_t length)
+{
+    if (length > 0) {
+        printf("Using WIFI password from the server.\n");
+    } else {
+        printf("WiFi password cleared, assuming open WiFi network.\n");
+    }
+    wifiPass = std::string((const char *)message, length);
+    wifiPassSet = true;
+    EnqueueRequest(I2C_CLIENT_RESET_QUEUE);
+    programState = State::WaitingForConnect;
 }
 
-/**
-   When the I2C server is started it can send a reset request (probably should). When this
-   client receives the reset, it should reset because it may have old data.
- */
-void ProcessReset() {
-   printf("Reset Received.\n");
-   reset();
-   programState = State::WaitForAPIVersion;
+void ProcessReset()
+{
+    printf("Reset Received.\n");
+    reset();
+    programState = State::WaitForAPIVersion;
 }
 
 void ProcessStaticIP(const uint8_t* message, size_t length)
 {
-   if (length <= 3)
-   {
-      static_ip_set = false;
-   }
-   else
-   {
-      static_ip_set = false;
-      const char *ip_data =  (const char*) &message[2];
-      if (strncmp("ip",(const char*) message, 2) == 0)
-      {
-         printf("Setting static IP to %s\n", ip_data);
-         static_ip_set = ip4addr_aton(ip_data, &static_ip);
-      }
-      else if (strncmp("nm", (const char*)message, 2) == 0)
-      {
-         printf("Setting static IP netmask to %s\n", ip_data);
-         static_ip_set = ip4addr_aton(ip_data, &static_netmask);
-      }
-      else if (strncmp("gw", (const char*)message, 2) == 0)
-      {
-         printf("Setting static IP gateway to %s\n", ip_data);
-         static_ip_set = ip4addr_aton(ip_data, &static_gw);
-      }
-   }
+    if (length <= 3) {
+        static_ip_set = false;
+    } else {
+        static_ip_set = false;
+        const char *ip_data = (const char*) &message[2];
+        if (strncmp("ip", (const char*)message, 2) == 0) {
+            printf("Setting static IP to %s\n", ip_data);
+            static_ip_set = ip4addr_aton(ip_data, &static_ip);
+        } else if (strncmp("nm", (const char*)message, 2) == 0) {
+            printf("Setting static IP netmask to %s\n", ip_data);
+            static_ip_set = ip4addr_aton(ip_data, &static_netmask);
+        } else if (strncmp("gw", (const char*)message, 2) == 0) {
+            printf("Setting static IP gateway to %s\n", ip_data);
+            static_ip_set = ip4addr_aton(ip_data, &static_gw);
+        }
+    }
 }
 
-void ProcessIPAddressAck() {
-   ipAddrState = IPAddressState::Received;
-   printf("Server received IP Address.\n");
-
+void ProcessIPAddressAck()
+{
+    ipAddrState = IPAddressState::Received;
+    printf("Server received IP Address.\n");
 }
+
+void ProcessDeviceList(const uint8_t *message, size_t length)
+{
+    memset(deviceListJson, 0, sizeof(deviceListJson));
+    size_t copy_len = length < sizeof(deviceListJson) - 1 ? length : sizeof(deviceListJson) - 1;
+    memcpy(deviceListJson, message, copy_len);
+    printf("Received device list JSON (%zu bytes)\n", length);
+}
+
+void ProcessSDStatus(const uint8_t *message, size_t length)
+{
+    if (length < 1) return;
+    g_sd_present = (message[0] == I2C_SERVER_SD_PRESENT);
+    printf("SD card %s\n", g_sd_present ? "present" : "not present");
+}
+
 }  // namespace zuluide::i2c::client
 
-/**
-   Redirect a request to /version to /version.json.
- */
+// ── CGI handlers ─────────────────────────────────────────────────────────────
+
 static const char *cgi_handler_version(int index, int numParams, char *pcParam[], char *pcValue[]) {
-   return "/version.json";
+    return "/version.json";
 }
 
-/**
-   Redirect a request to /status to /status.json.
- */
 static const char *cgi_handler_status(int index, int numParams, char *pcParam[], char *pcValue[]) {
-   return "/status.json";
+    return "/status.json";
 }
 
 static const char *cgi_handler_filenames(int index, int numParams, char *pcParam[], char *pcValue[]) {
-   printf("Sending filenames cached JSON\n");
-   if (filenameState == FilenameCacheState::Full) {
-      if (!zuluide::i2c::client::EnqueueRequest(I2C_CLIENT_FETCH_FILENAMES)) {
-         printf("Failed to add fetch filenames to output queue.\n");
-      }
-   }
+    printf("Filenames CGI requested\n");
 
-   if (filenameState == FilenameCacheState::Start ||  filenameState == FilenameCacheState::Fetching) {
-      return "/wait.json";
-   }
+    if (g_device_type == DeviceType::ZuluSCSI) {
+        uint8_t req_id = 0;
+        for (int i = 0; i < numParams; i++) {
+            if (strncmp(pcParam[i], "scsiId", 7) == 0) {
+                req_id = (uint8_t)atoi(pcValue[i]);
+            }
+        }
+        if (req_id >= MAX_SCSI_IDS) req_id = 0;
 
-   if (filenameState == FilenameCacheState::Overflow) {
-      return "/overflow.json";
-   }
+        // Cache hit: this ID has a valid pointer and no overflow has occurred.
+        // The cache is used only when all responses that were pushed by ZuluSCSI
+        // fit in the single buffer (overflow flag stays clear).
+        if (g_filenames_scsi_id[req_id] != nullptr && !g_filenames_overflow) {
+            printf("Serving cached filenames for SCSI ID %u\n", req_id);
+            g_filenames_serving_id = req_id;
+            return "/filenames.json";
+        }
 
-   return "/filenames.json";
+        // A fetch is already in progress for this exact ID - wait for it.
+        if (g_filenames_active_id == req_id) {
+            return "/wait.json";
+        }
+
+        // Cache miss with no active fetch: request from ZuluSCSI.
+        if (filenameState == FilenameCacheState::Idle ||
+            filenameState == FilenameCacheState::Overflow) {
+            printf("Requesting filenames for SCSI ID %u from ZuluSCSI\n", req_id);
+            g_filenames_active_id = req_id;
+            g_filenames_serving_id = req_id;
+            uint8_t payload[1] = {req_id};
+            if (!zuluide::i2c::client::EnqueueRequestBinary(I2C_CLIENT_FETCH_FILENAMES, payload, 1)) {
+                printf("Failed to add fetch filenames to output queue.\n");
+            }
+        }
+        return "/wait.json";
+
+    } else {
+        // ZuluIDE: single-device; serve from cache (slot 0) and trigger background refresh.
+        g_filenames_active_id = 0;
+        g_filenames_serving_id = 0;
+        if (filenameState == FilenameCacheState::Full) {
+            if (!zuluide::i2c::client::EnqueueRequest(I2C_CLIENT_FETCH_FILENAMES)) {
+                printf("Failed to add fetch filenames to output queue.\n");
+            }
+        } else if (filenameState == FilenameCacheState::Idle) {
+            if (!zuluide::i2c::client::EnqueueRequest(I2C_CLIENT_FETCH_FILENAMES)) {
+                printf("Failed to add fetch filenames to output queue.\n");
+            }
+            filenameState = FilenameCacheState::Fetching;
+        }
+    }
+
+    if (filenameState == FilenameCacheState::Start || filenameState == FilenameCacheState::Fetching) {
+        return "/wait.json";
+    }
+    if (filenameState == FilenameCacheState::Overflow) {
+        return "/overflow.json";
+    }
+    return "/filenames.json";
 }
 
-/**
-   Fetches the entire set of images. If the images are not yet available then
-   a wait response is sent.
- */
 static const char *cgi_handler_imgs(int index, int numParams, char *pcParam[], char *pcValue[]) {
-   if (imageState == ImageCacheState::Idle) {
-      imageState = ImageCacheState::Fetching;
-      if (!zuluide::i2c::client::EnqueueRequest(I2C_CLIENT_FETCH_IMAGES_JSON)) {
-         printf("Failed to add fetch images to output queue.\n");
-      }
-   }
+    if (g_device_type == DeviceType::ZuluSCSI) {
+        uint8_t scsi_id = 0;
+        for (int i = 0; i < numParams; i++) {
+            if (strncmp(pcParam[i], "scsiId", 7) == 0) {
+                scsi_id = (uint8_t)atoi(pcValue[i]);
+            }
+        }
+        if (imageState == ImageCacheState::Idle) {
+            imageState = ImageCacheState::Fetching;
+            uint8_t payload[1] = {scsi_id};
+            if (!zuluide::i2c::client::EnqueueRequestBinary(I2C_CLIENT_FETCH_IMAGES_JSON, payload, 1)) {
+                printf("Failed to add fetch images to output queue.\n");
+            }
+        }
+    } else {
+        if (imageState == ImageCacheState::Idle) {
+            imageState = ImageCacheState::Fetching;
+            if (!zuluide::i2c::client::EnqueueRequest(I2C_CLIENT_FETCH_IMAGES_JSON)) {
+                printf("Failed to add fetch images to output queue.\n");
+            }
+        }
+    }
 
-   if (imageState == ImageCacheState::Fetching) {
-      return "/wait.json";
-   }
-
-   return "/images.json";
+    if (imageState == ImageCacheState::Fetching) {
+        return "/wait.json";
+    }
+    return "/images.json";
 }
 
-/**
-   Fetches the next image when iterating the images. A wait message is sent when
-   an image is not ready. A done message is sent when the iteration if finished.
- */
 static const char *cgi_handler_next_image(int index, int numParams, char *pcParam[], char *pcValue[]) {
-   if (imageState == ImageCacheState::Idle) {
-      if (!zuluide::i2c::client::EnqueueRequest(I2C_CLIENT_FETCH_ITR_IMAGE)) {
-         printf("Failed to add iterate image to output queue.\n");
-      }
+    uint8_t scsi_id = 0;
+    for (int i = 0; i < numParams; i++) {
+        if (strncmp(pcParam[i], "scsiId", 7) == 0) {
+            scsi_id = (uint8_t)atoi(pcValue[i]);
+        }
+    }
 
-      imageState = ImageCacheState::Iterating;
-
-      return "/wait.json";
-   } else if (imageState == ImageCacheState::Iterating) {
-      if (queue_is_empty(&imageQueue)) {
-         return "/wait.json";
-      } else {
-         // We have something that we are about to send out, lets fetch the next so we can be ready.
-         if (!zuluide::i2c::client::EnqueueRequest(I2C_CLIENT_FETCH_ITR_IMAGE)) {
-            printf("Failed to add iterate image to output queue.\n");
-         }
-      }
-   } else if (imageState == ImageCacheState::IteratingFinished) {
-      imageState = ImageCacheState::Idle;
-      return "/done.json";
-   }
-
-   return "/nextImage.json";
+    if (imageState == ImageCacheState::Idle) {
+        if (g_device_type == DeviceType::ZuluSCSI) {
+            uint8_t payload[1] = {scsi_id};
+            if (!zuluide::i2c::client::EnqueueRequestBinary(I2C_CLIENT_FETCH_ITR_IMAGE, payload, 1)) {
+                printf("Failed to add iterate image to output queue.\n");
+            }
+        } else {
+            if (!zuluide::i2c::client::EnqueueRequest(I2C_CLIENT_FETCH_ITR_IMAGE)) {
+                printf("Failed to add iterate image to output queue.\n");
+            }
+        }
+        imageState = ImageCacheState::Iterating;
+        return "/wait.json";
+    } else if (imageState == ImageCacheState::Iterating) {
+        if (queue_is_empty(&imageQueue)) {
+            return "/wait.json";
+        } else {
+            if (g_device_type == DeviceType::ZuluSCSI) {
+                uint8_t payload[1] = {scsi_id};
+                if (!zuluide::i2c::client::EnqueueRequestBinary(I2C_CLIENT_FETCH_ITR_IMAGE, payload, 1)) {
+                    printf("Failed to add iterate image to output queue.\n");
+                }
+            } else {
+                if (!zuluide::i2c::client::EnqueueRequest(I2C_CLIENT_FETCH_ITR_IMAGE)) {
+                    printf("Failed to add iterate image to output queue.\n");
+                }
+            }
+        }
+    } else if (imageState == ImageCacheState::IteratingFinished) {
+        imageState = ImageCacheState::Idle;
+        return "/done.json";
+    }
+    return "/nextImage.json";
 }
 
-/**
-   Processes a user attempting to mount an image with the image JSON provided in the
-   query parameter imageName.
- */
 static const char *cgi_handler_image(int index, int numParams, char *params[], char *values[]) {
-   if (numParams > 0) {
-      for (int i = 0; i < numParams; i++) {
-         if (strncmp(params[i], "imageName", sizeof("imageName")) == 0) {
-            // Decoding parameters that were URL encoded.
+    uint8_t scsi_id = 0;
+    const char *image_name = NULL;
+
+    for (int i = 0; i < numParams; i++) {
+        if (strncmp(params[i], "imageName", 10) == 0) {
             urldecode(values[i]);
-            printf("Setting image to: %s\n", values[i]);
-            zuluide::i2c::client::EnqueueRequest(I2C_CLIENT_LOAD_IMAGE, values[i]);
-            return "/ok.json";
-         }
-      }
-   }
+            image_name = values[i];
+        } else if (strncmp(params[i], "scsiId", 7) == 0) {
+            scsi_id = (uint8_t)atoi(values[i]);
+        }
+    }
 
-   return "/error.json";
+    if (image_name == NULL) return "/error.json";
+
+    if (g_device_type == DeviceType::ZuluSCSI) {
+        // Prepend scsi_id byte before the path
+        size_t path_len = strlen(image_name);
+        uint8_t *payload = new uint8_t[1 + path_len];
+        payload[0] = scsi_id;
+        memcpy(payload + 1, image_name, path_len);
+        printf("ZuluSCSI loading image \"%s\" on SCSI ID %u\n", image_name, scsi_id);
+        zuluide::i2c::client::EnqueueRequestBinary(I2C_CLIENT_LOAD_IMAGE, payload, (uint16_t)(1 + path_len));
+        delete[] payload;
+    } else {
+        printf("ZuluIDE setting image to: %s\n", image_name);
+        zuluide::i2c::client::EnqueueRequest(I2C_CLIENT_LOAD_IMAGE, image_name);
+    }
+    return "/ok.json";
 }
 
-/**
-   Allows the user to eject the currently mounted image.
-*/
 static const char *cgi_handler_eject(int index, int numParams, char *params[], char *values[]) {
-   zuluide::i2c::client::EnqueueRequest(I2C_CLIENT_EJECT_IMAGE);
-   return "/ok.json";
+    if (g_device_type == DeviceType::ZuluSCSI) {
+        uint8_t scsi_id = 0;
+        for (int i = 0; i < numParams; i++) {
+            if (strncmp(params[i], "scsiId", 7) == 0) {
+                scsi_id = (uint8_t)atoi(values[i]);
+            }
+        }
+        printf("ZuluSCSI ejecting SCSI ID %u\n", scsi_id);
+        uint8_t payload[1] = {scsi_id};
+        zuluide::i2c::client::EnqueueRequestBinary(I2C_CLIENT_EJECT_IMAGE, payload, 1);
+    } else {
+        zuluide::i2c::client::EnqueueRequest(I2C_CLIENT_EJECT_IMAGE);
+    }
+    return "/ok.json";
 }
 
+static const char *cgi_handler_insert_media(int index, int numParams, char *params[], char *values[]) {
+    uint8_t scsi_id = 0;
+    for (int i = 0; i < numParams; i++) {
+        if (strncmp(params[i], "scsiId", 7) == 0) {
+            scsi_id = (uint8_t)atoi(values[i]);
+        }
+    }
+    printf("ZuluSCSI inserting media on SCSI ID %u\n", scsi_id);
+    uint8_t payload[1] = {scsi_id};
+    zuluide::i2c::client::EnqueueRequestBinary(I2C_CLIENT_INSERT_MEDIA, payload, 1);
+    return "/ok.json";
+}
+
+static const char *cgi_handler_device_list(int index, int numParams, char *params[], char *values[]) {
+    zuluide::i2c::client::EnqueueRequest(I2C_CLIENT_FETCH_DEVICE_LIST);
+    return "/devicelist.json";
+}
 
 static const tCGI cgi_handlers[] = {
-                                    {"/version", cgi_handler_version},
-                                    {"/status", cgi_handler_status},
-                                    {"/filenames", cgi_handler_filenames},
-                                    {"/images", cgi_handler_imgs},
-                                    {"/image", cgi_handler_image},
-                                    {"/eject", cgi_handler_eject},
-                                    {"/nextImage", cgi_handler_next_image}
+    {"/version",     cgi_handler_version},
+    {"/status",      cgi_handler_status},
+    {"/filenames",   cgi_handler_filenames},
+    {"/images",      cgi_handler_imgs},
+    {"/image",       cgi_handler_image},
+    {"/eject",       cgi_handler_eject},
+    {"/nextImage",   cgi_handler_next_image},
+    {"/insertMedia", cgi_handler_insert_media},
+    {"/deviceList",  cgi_handler_device_list},
 };
 
-/* Handlers for POST requests */
+// ── POST handlers (firmware upgrade) ─────────────────────────────────────────
 
 err_t (*g_httpd_post_receive_data_handler)(void *connection, struct pbuf *p);
 void (*g_httpd_post_finished_handler)(void *connection, char *response_uri, u16_t response_uri_len);
@@ -569,415 +738,392 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
                        u16_t http_request_len, int content_len, char *response_uri,
                        u16_t response_uri_len, u8_t *post_auto_wnd)
 {
-   if (strcmp(uri, "/fw_upgrade.cgi") == 0)
-   {
-      g_httpd_post_receive_data_handler = &fwupgrade_post_receive_data;
-      g_httpd_post_finished_handler = &fwupgrade_post_finished;
-      return fwupgrade_post_begin(connection, uri, http_request, http_request_len, content_len,
-         response_uri, response_uri_len, post_auto_wnd);
-   }
-
-   g_httpd_post_receive_data_handler = nullptr;
-   g_httpd_post_finished_handler = nullptr;
-   return ERR_VAL;
+    if (strcmp(uri, "/fw_upgrade.cgi") == 0) {
+        g_httpd_post_receive_data_handler = &fwupgrade_post_receive_data;
+        g_httpd_post_finished_handler     = &fwupgrade_post_finished;
+        return fwupgrade_post_begin(connection, uri, http_request, http_request_len, content_len,
+                                    response_uri, response_uri_len, post_auto_wnd);
+    }
+    g_httpd_post_receive_data_handler = nullptr;
+    g_httpd_post_finished_handler     = nullptr;
+    return ERR_VAL;
 }
 
 err_t httpd_post_receive_data(void *connection, struct pbuf *p)
 {
-   err_t result = ERR_VAL;
-   if (g_httpd_post_receive_data_handler)
-      result = g_httpd_post_receive_data_handler(connection, p);
-
-   return result;
+    err_t result = ERR_VAL;
+    if (g_httpd_post_receive_data_handler)
+        result = g_httpd_post_receive_data_handler(connection, p);
+    return result;
 }
 
 void httpd_post_finished(void *connection, char *response_uri, u16_t response_uri_len)
 {
-   if (g_httpd_post_finished_handler)
-      g_httpd_post_finished_handler(connection, response_uri, response_uri_len);
-
-   g_httpd_post_receive_data_handler = nullptr;
-   g_httpd_post_finished_handler = nullptr;
+    if (g_httpd_post_finished_handler)
+        g_httpd_post_finished_handler(connection, response_uri, response_uri_len);
+    g_httpd_post_receive_data_handler = nullptr;
+    g_httpd_post_finished_handler     = nullptr;
 }
 
+// ── Core 1 (I2C slave) ────────────────────────────────────────────────────────
+
 void core1_main() {
-   zuluide::i2c::client::Init(I2C_SLAVE_SDA_PIN, I2C_SLAVE_SCL_PIN, I2C_SLAVE_ADDRESS, I2C_BAUDRATE);
-   multicore_fifo_push_blocking(0xbeef);
-   while(true)
-   {
-      tight_loop_contents();
-   }
+    zuluide::i2c::client::Init(I2C_SLAVE_SDA_PIN, I2C_SLAVE_SCL_PIN, I2C_SLAVE_ADDRESS, I2C_BAUDRATE);
+    multicore_fifo_push_blocking(0xbeef);
+    while (true) { tight_loop_contents(); }
 }
 
 static bool has_elapsed(uint32_t start, uint32_t elapsed) {
-   return (uint32_t)(millis() - start) > elapsed;
+    return (uint32_t)(millis() - start) > elapsed;
 }
 
 void start_multicore_i2c() {
-   multicore_launch_core1(core1_main);
-   uint32_t g = multicore_fifo_pop_blocking();
-   if (g == 0xbeef)
-      printf("Core 1 successfully launched");
-   else {
-      printf("Core 1 failed to launch");
-   }
+    multicore_launch_core1(core1_main);
+    uint32_t g = multicore_fifo_pop_blocking();
+    if (g == 0xbeef) printf("Core 1 successfully launched");
+    else              printf("Core 1 failed to launch");
 }
 
 using zuluide::i2c::client::LogMessageToServer;
 
+// ── Main ──────────────────────────────────────────────────────────────────────
+
 int main() {
-   gpio_set_pulls(GPIO_BOARD_TYPE, true, false);
-   // wait for pulls
-   busy_wait_us(1);
-   g_board_type_b = !gpio_get(GPIO_BOARD_TYPE);
-   if (g_board_type_b)
-   {
-      // init Led connected directly to the MCU
-      gpio_set_function(GPIO_MCU_LED, GPIO_FUNC_SIO);
-      gpio_set_pulls(GPIO_MCU_LED, false, false);
-      gpio_put(GPIO_MCU_LED, true);
-      gpio_set_drive_strength(GPIO_MCU_LED, GPIO_DRIVE_STRENGTH_12MA);
-      gpio_set_slew_rate(GPIO_MCU_LED, GPIO_SLEW_RATE_SLOW);
-      gpio_set_dir(GPIO_MCU_LED, true);
-   }
+    gpio_set_pulls(GPIO_BOARD_TYPE, true, false);
+    busy_wait_us(1);
+    g_board_type_b = !gpio_get(GPIO_BOARD_TYPE);
+    if (g_board_type_b) {
+        gpio_set_function(GPIO_MCU_LED, GPIO_FUNC_SIO);
+        gpio_set_pulls(GPIO_MCU_LED, false, false);
+        gpio_put(GPIO_MCU_LED, true);
+        gpio_set_drive_strength(GPIO_MCU_LED, GPIO_DRIVE_STRENGTH_12MA);
+        gpio_set_slew_rate(GPIO_MCU_LED, GPIO_SLEW_RATE_SLOW);
+        gpio_set_dir(GPIO_MCU_LED, true);
+    }
 
-   stdio_init_all();
-   printf("Starting.\n");
+    stdio_init_all();
+    printf("Starting.\n");
 
-   memset(currentStatus, 0, MAX_MSG_SIZE);
-   memset(versionJson, '\0', MAX_MSG_SIZE);
-   sprintf(versionJson,"{\"clientAPIVersion\":\"%s\", \"serverAPIVersion\": \"server failed to send version\"}", I2C_API_VERSION);
-   queue_init(&imageQueue, sizeof(char *), 1);
+    memset(currentStatus, 0, MAX_MSG_SIZE);
+    memset(versionJson, '\0', MAX_MSG_SIZE);
+    memset(deviceListJson, '\0', MAX_MSG_SIZE);
+    sprintf(versionJson, "{\"clientAPIVersion\":\"%s\", \"serverAPIVersion\": \"server failed to send version\", \"deviceType\":\"Unknown\"}",
+            I2C_API_VERSION);
+    queue_init(&imageQueue, sizeof(char *), 1);
 
-   start_multicore_i2c();
+    start_multicore_i2c();
 
-   if (cyw43_arch_init()) {
-      LogMessageToServer(ClientMessage::Type::Normal, "Failed to initialize WiFi interface. WiFi client halting.");
-      return 1;
-   }
+    if (cyw43_arch_init()) {
+        LogMessageToServer(ClientMessage::Type::Normal, "Failed to initialize WiFi interface. WiFi client halting.");
+        return 1;
+    }
 
-   bool httpInitialized = false;
-   bool started_blink = true;
-   bool blink_on = false;
-   uint32_t start_time = millis();
-   uint32_t send_ip_start_time = millis();
-   int number_of_blinks = 3;
-   uint32_t waiting_start = millis();
-   State last_state = State::Unknown;
-   while (true) {
-      // blink number_of_blink when board is powered on
-      if (started_blink)
-      {
-         if ((uint32_t)(millis() - start_time) > 500)
-         {
-            blink_on = !blink_on;
-            gpio_put(GPIO_MCU_LED, blink_on);
-            cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, blink_on);
-            start_time = millis();
-            if (!blink_on && --number_of_blinks <= 0)
-            {
-               started_blink = false;
+    bool httpInitialized = false;
+    bool started_blink = true;
+    bool blink_on = false;
+    uint32_t start_time = millis();
+    uint32_t send_ip_start_time = millis();
+    int number_of_blinks = 3;
+    uint32_t waiting_start = millis();
+    State last_state = State::Unknown;
+
+    while (true) {
+        // Startup blink
+        if (started_blink) {
+            if ((uint32_t)(millis() - start_time) > 500) {
+                blink_on = !blink_on;
+                gpio_put(GPIO_MCU_LED, blink_on);
+                cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, blink_on);
+                start_time = millis();
+                if (!blink_on && --number_of_blinks <= 0) {
+                    started_blink = false;
+                }
             }
-         }
-      }
+        }
 
-      switch (programState) {
-         case State::WaitForAPIVersion:
-            if (programState != last_state || has_elapsed(waiting_start, I2C_CMD_RETRY_MS))
-            {
-               zuluide::i2c::client::EnqueueRequest(I2C_CLIENT_API_VERSION, I2C_API_VERSION);
-               waiting_start = millis();
-            }
-            last_state = programState;
-            zuluide::i2c::client::ProcessMessages();
-            break;
-         case State::WaitingForSSID:
-            if (programState != last_state || has_elapsed(waiting_start, I2C_CMD_RETRY_MS))
-            {
-               printf("Waiting for SSID\n");
-               if (!zuluide::i2c::client::EnqueueRequest(I2C_CLIENT_FETCH_SSID)) {
-                     printf("Failed to add request for SSID to output queue\n");
-               }
-               waiting_start = millis();
-            }
-            last_state = programState;
-            zuluide::i2c::client::ProcessMessages();
-            break;
-         case State::WaitingForPassword: {
-            if (programState != last_state || has_elapsed(waiting_start, I2C_CMD_RETRY_MS))
-            {
-               printf("Waiting for Password\n");
-               if (!zuluide::i2c::client::EnqueueRequest(I2C_CLIENT_FETCH_SSID_PASS)) {
-                  printf("Failed to add request for Password to output queue\n");
-               }
-               waiting_start = millis();
-            }
-            last_state = programState;
-            zuluide::i2c::client::ProcessMessages();
-            break;
-         }
-         case State::WaitingForConnect:
-         {
-            if (programState != last_state)
-               printf("Waiting for Connect\n");
-            last_state = programState;
-            zuluide::i2c::client::ProcessMessages();
-            break;
-         }
+        switch (programState) {
+            case State::WaitForAPIVersion:
+                if (programState != last_state || has_elapsed(waiting_start, I2C_CMD_RETRY_MS)) {
+                    zuluide::i2c::client::EnqueueRequest(I2C_CLIENT_API_VERSION, I2C_API_VERSION);
+                    waiting_start = millis();
+                }
+                last_state = programState;
+                zuluide::i2c::client::ProcessMessages();
+                break;
 
-         case State::WIFIInit: {
-            last_state = programState;
-            if (wifiSSID.empty()) {
-               programState = State::WaitingForSSID;
-               break;
-            }
-            printf("Initializing to WiFi.\n");
-            started_blink = false;
-            gpio_put(GPIO_MCU_LED, false);
+            case State::WaitingForSSID:
+                if (programState != last_state || has_elapsed(waiting_start, I2C_CMD_RETRY_MS)) {
+                    printf("Waiting for SSID\n");
+                    if (!zuluide::i2c::client::EnqueueRequest(I2C_CLIENT_FETCH_SSID)) {
+                        printf("Failed to add request for SSID to output queue\n");
+                    }
+                    waiting_start = millis();
+                }
+                last_state = programState;
+                zuluide::i2c::client::ProcessMessages();
+                break;
 
-            cyw43_arch_enable_sta_mode();
-            // Disable powersave mode.
-            cyw43_wifi_pm(&cyw43_state, cyw43_pm_value(CYW43_NO_POWERSAVE_MODE, 20, 1, 1, 1));
+            case State::WaitingForPassword:
+                if (programState != last_state || has_elapsed(waiting_start, I2C_CMD_RETRY_MS)) {
+                    printf("Waiting for Password\n");
+                    if (!zuluide::i2c::client::EnqueueRequest(I2C_CLIENT_FETCH_SSID_PASS)) {
+                        printf("Failed to add request for Password to output queue\n");
+                    }
+                    waiting_start = millis();
+                }
+                last_state = programState;
+                zuluide::i2c::client::ProcessMessages();
+                break;
 
-            if (static_ip_set)
-            {
-               printf("Setting up static IP\n");
-               cyw43_arch_lwip_begin();
-               dhcp_stop(cyw43_state.netif);     // turn off DHCP
-               netif_set_addr(cyw43_state.netif, &static_ip,&static_netmask,&static_gw);
-               cyw43_arch_lwip_end();
-            }
-            else
-            {
-               printf("Setting up DHCP\n");
-               cyw43_arch_lwip_begin();
-               dhcp_start(cyw43_state.netif);     // turn on DHCP
-               cyw43_arch_lwip_end();
+            case State::WaitingForConnect:
+                if (programState != last_state) printf("Waiting for Connect\n");
+                last_state = programState;
+                zuluide::i2c::client::ProcessMessages();
+                break;
+
+            case State::WIFIInit: {
+                last_state = programState;
+                if (wifiSSID.empty()) {
+                    programState = State::WaitingForSSID;
+                    break;
+                }
+                printf("Initializing to WiFi.\n");
+                started_blink = false;
+                gpio_put(GPIO_MCU_LED, false);
+
+                cyw43_arch_enable_sta_mode();
+                cyw43_wifi_pm(&cyw43_state, cyw43_pm_value(CYW43_NO_POWERSAVE_MODE, 20, 1, 1, 1));
+
+                if (static_ip_set) {
+                    printf("Setting up static IP\n");
+                    cyw43_arch_lwip_begin();
+                    dhcp_stop(cyw43_state.netif);
+                    netif_set_addr(cyw43_state.netif, &static_ip, &static_netmask, &static_gw);
+                    cyw43_arch_lwip_end();
+                } else {
+                    printf("Setting up DHCP\n");
+                    cyw43_arch_lwip_begin();
+                    dhcp_start(cyw43_state.netif);
+                    cyw43_arch_lwip_end();
+                }
+                programState = State::WIFIDown;
+                break;
             }
 
-            programState = State::WIFIDown;
-            break;
-         }
+            case State::WIFIDown: {
+                last_state = programState;
+                if (wifiSSID.empty()) {
+                    cyw43_arch_lwip_begin();
+                    dhcp_stop(cyw43_state.netif);
+                    cyw43_arch_lwip_end();
+                    reset();
+                    programState = State::WaitingForSSID;
+                } else {
+                    bool open_network = (wifiPassSet && wifiPass.empty()) || (!wifiPassSet && sizeof(WIFI_PASSWORD) == 0);
 
-         case State::WIFIDown: {
-            last_state = programState;
+                    if (open_network) {
+                        LogMessageToServer(ClientMessage::Type::Normal, "Connecting to open WiFi network: %s", wifiSSID.c_str());
+                    } else {
+                        LogMessageToServer(ClientMessage::Type::Normal, "Connecting to secured WiFi network: %s", wifiSSID.c_str());
+                    }
 
-            if (wifiSSID.empty()) {
-               cyw43_arch_lwip_begin();
-               dhcp_stop(cyw43_state.netif);
-               cyw43_arch_lwip_end();
-               reset();
-               programState = State::WaitingForSSID;
-            } else {
-               bool open_network = (wifiPassSet && wifiPass.empty()) || (!wifiPassSet && sizeof(WIFI_PASSWORD) == 0);
+                    int connection_result;
+                    if (open_network) {
+                        connection_result = cyw43_arch_wifi_connect_timeout_ms(
+                            wifiSSID.c_str(), nullptr, CYW43_AUTH_OPEN, WIFI_CONNECT_TIMEOUT_MS);
+                    } else {
+                        connection_result = cyw43_arch_wifi_connect_timeout_ms(
+                            wifiSSID.c_str(), wifiPassSet ? wifiPass.c_str() : WIFI_PASSWORD,
+                            CYW43_AUTH_WPA2_AES_PSK, WIFI_CONNECT_TIMEOUT_MS);
+                    }
 
-               if (open_network) {
-                  LogMessageToServer(ClientMessage::Type::Normal, "Connecting to open WiFi network: %s", wifiSSID.c_str());
-               } else {
-                  LogMessageToServer(ClientMessage::Type::Normal, "Connecting to secured WiFi network: %s", wifiSSID.c_str());
-               }
+                    if (PICO_ERROR_NONE != connection_result) {
+                        reset();
+                        LogMessageToServer(ClientMessage::Type::Normal, "Failed to connect to WiFi.");
+                        programState = State::WaitingForSSID;
+                    } else {
+                        zuluide::i2c::client::EnqueueRequest(I2C_CLIENT_RESET_QUEUE);
+                        LogMessageToServer(ClientMessage::Type::Normal, "Connected to WiFi.");
+                        extern cyw43_t cyw43_state;
+                        auto ip_addr = cyw43_state.netif[CYW43_ITF_STA].ip_addr.addr;
 
-               int connection_result;  
-               if (open_network) {
-                     connection_result = cyw43_arch_wifi_connect_timeout_ms(
-                        wifiSSID.c_str(),
-                        nullptr,
-                        CYW43_AUTH_OPEN,
-                        WIFI_CONNECT_TIMEOUT_MS);
-               } else {
-                     connection_result = cyw43_arch_wifi_connect_timeout_ms(
-                        wifiSSID.c_str(), wifiPassSet ? wifiPass.c_str() : WIFI_PASSWORD,
-                        CYW43_AUTH_WPA2_AES_PSK,
-                        WIFI_CONNECT_TIMEOUT_MS);
-               }
-               if (PICO_ERROR_NONE != connection_result) {
-                  reset();
-                  LogMessageToServer(ClientMessage::Type::Normal, "Failed to connect to WiFi.");
-                  programState = State::WaitingForSSID;
-               } else {
-                  zuluide::i2c::client::EnqueueRequest(I2C_CLIENT_RESET_QUEUE);
-                  LogMessageToServer(ClientMessage::Type::Normal, "Connected to WiFi.");
-                  extern cyw43_t cyw43_state;
-                  auto ip_addr = cyw43_state.netif[CYW43_ITF_STA].ip_addr.addr;
+                        memset(ipBuffer, 0, 32);
+                        sprintf(ipBuffer, "%lu.%lu.%lu.%lu",
+                                ip_addr & 0xFF, (ip_addr >> 8) & 0xFF,
+                                (ip_addr >> 16) & 0xFF, ip_addr >> 24);
+                        printf("IP Address: %s\n", ipBuffer);
+                        ipAddrState = IPAddressState::Sending;
 
-                  memset(ipBuffer, 0, 32);
-                  sprintf(ipBuffer, "%lu.%lu.%lu.%lu", ip_addr & 0xFF, (ip_addr >> 8) & 0xFF, (ip_addr >> 16) & 0xFF, ip_addr >> 24);
-                  printf("IP Address: %s\n", ipBuffer);
+                        if (!httpInitialized) {
+                            httpd_init();
+                            http_set_cgi_handlers(cgi_handlers, sizeof(cgi_handlers) / sizeof(cgi_handlers[0]));
+                            LogMessageToServer(ClientMessage::Type::Debug, "Http server initialized.");
+                            httpInitialized = true;
+                        }
 
-                  ipAddrState = IPAddressState::Sending;
+                        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
 
-                  if (!httpInitialized) {
-                     httpd_init();
-                     http_set_cgi_handlers(cgi_handlers, sizeof(cgi_handlers)/sizeof(cgi_handlers[0]));
-                     LogMessageToServer(ClientMessage::Type::Debug, "Http server initialized.");
-                     httpInitialized = true;
-                  }
-
-                  cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
-
-                  // Put a subscribe message in the queue so when we connect, we immediately subscribe.
-                  if (!zuluide::i2c::client::EnqueueRequest(I2C_CLIENT_SUBSCRIBE_STATUS_JSON)) {
-                     printf("Failed to add subscribe to output queue.\n");
-                  }
-                  programState = State::Normal;
-                  LogMessageToServer(ClientMessage::Type::Debug, "System Ready");
-               }
+                        if (!zuluide::i2c::client::EnqueueRequest(I2C_CLIENT_SUBSCRIBE_STATUS_JSON)) {
+                            printf("Failed to add subscribe to output queue.\n");
+                        }
+                        programState = State::Normal;
+                        LogMessageToServer(ClientMessage::Type::Debug, "System Ready");
+                    }
+                }
+                break;
             }
-            break;
-         }
 
-         case State::Normal: {
-            last_state = programState;
-            // Allow I2C functions to process messages and make callbacks as appropriate.
-            zuluide::i2c::client::ProcessMessages();
-
-            // Test for WIFI going down.
-            if (cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA) != CYW43_LINK_UP) {
-               programState = State::WIFIDown;
-               LogMessageToServer(ClientMessage::Type::Normal, "WiFi connection down.\n");
-
-               cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
-               gpio_put(GPIO_MCU_LED, false);
-               started_blink = false;
+            case State::Normal: {
+                last_state = programState;
+                zuluide::i2c::client::ProcessMessages();
+                if (cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA) != CYW43_LINK_UP) {
+                    programState = State::WIFIDown;
+                    LogMessageToServer(ClientMessage::Type::Normal, "WiFi connection down.\n");
+                    cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 0);
+                    gpio_put(GPIO_MCU_LED, false);
+                    started_blink = false;
+                }
+                break;
             }
-            break;
-         }
 
-         default: {
-            last_state = State::Unknown;
-            printf("Error, unkown state.\n");
-            break;
-         }
-      }
+            default:
+                last_state = State::Unknown;
+                printf("Error, unknown state.\n");
+                break;
+        }
 
-      if ((uint32_t)(millis() - send_ip_start_time) > 3000)
-      {
+        if ((uint32_t)(millis() - send_ip_start_time) > 3000) {
+            if (IPAddressState::Sending == ipAddrState) {
+                printf("Sending ip address %s\n", ipBuffer);
+                zuluide::i2c::client::EnqueueRequest(I2C_CLIENT_IP_ADDRESS, ipBuffer);
+            }
+            send_ip_start_time = millis();
+        }
+    }
 
-         if (IPAddressState::Sending == ipAddrState)
-         {
-            printf("Sending ip address %s\n", ipBuffer);
-            // Send the IP address to the I2C server.
-            zuluide::i2c::client::EnqueueRequest(I2C_CLIENT_IP_ADDRESS, ipBuffer);
-         }
-         send_ip_start_time = millis();
-      }
-   }
-
-
-
-   return 0;
+    return 0;
 }
 
-/**
-   Builds a JSON document using the individual image JSON items sotred in images.
-   After it is finished, it clears images and puts the result in imageJson
- */
+// ── Image JSON rebuild ────────────────────────────────────────────────────────
+
 void RebuildImageJson() {
-   size_t totalSize = 2;
-   for (auto item : images) {
-      totalSize += strlen(item) + 1;
-   }
+    size_t totalSize = 2;
+    for (auto item : images) {
+        totalSize += strlen(item) + 1;
+    }
 
-   if (imageJson != NULL) {
-      delete[] imageJson;
-   }
+    if (imageJson != NULL) {
+        delete[] imageJson;
+    }
 
-   imageJson = new char[totalSize + 3];
-   imageJson[0] = '[';
-   int pos = 1;
-   for (auto item : images) {
-      if (pos > 1) {
-         strcat(imageJson, ",");
-         pos++;
-      }
+    imageJson = new char[totalSize + 3];
+    imageJson[0] = '[';
+    int pos = 1;
+    for (auto item : images) {
+        if (pos > 1) {
+            strcat(imageJson, ",");
+            pos++;
+        }
+        strcat(imageJson, item);
+        pos += strlen(item);
+    }
+    imageJson[pos] = ']';
+    imageJson[pos + 1] = 0;
 
-      strcat(imageJson, item);
-      pos += strlen(item);
-   }
-
-   imageJson[pos] = ']';
-   imageJson[pos + 1] = 0;
-
-   // Delete the images prior to clearing them.
-   for (auto item : images) {
-      delete[] item;
-   }
-
-   images.clear();
+    for (auto item : images) { delete[] item; }
+    images.clear();
 }
+
+// ── Custom file system (lwIP httpd) ──────────────────────────────────────────
 
 int get_file_contents(struct fs_file *file, const char *fileContents, int fileLen) {
-   memset(file, 0, sizeof(struct fs_file));
-   if (fileContents) {
-      file->pextension = (void*)fileContents;
-      file->data = NULL;
-      file->len = fileLen;
-      file->index = 0;
-      file->flags = FS_FILE_FLAGS_HEADER_PERSISTENT;
-      return 1;
-   } else {
-      return 0;
-   }
+    memset(file, 0, sizeof(struct fs_file));
+    if (fileContents) {
+        file->pextension = (void*)fileContents;
+        file->data  = NULL;
+        file->len   = fileLen;
+        file->index = 0;
+        file->flags = FS_FILE_FLAGS_HEADER_PERSISTENT;
+        return 1;
+    }
+    return 0;
 }
 
 int fs_open_custom(struct fs_file *file, const char *name) {
-   printf("open custom name: %s\n", name);
-   if (strncmp(name, "/status.json", sizeof("/status.json")) == 0) {
-      return get_file_contents(file, currentStatus, strlen(currentStatus));
-   } else if (strncmp(name, "/images.json", sizeof("/images.json")) == 0) {
-      return get_file_contents(file, imageJson, strlen(imageJson));
-   } else if (strncmp(name, "/ok.json", sizeof("/ok.json")) == 0) {
-      auto okMessage = "{\"status\": \"ok\"}";
-      return get_file_contents(file, okMessage, strlen(okMessage));
-   } else if (strncmp(name, "/wait.json", sizeof("/wait.json")) == 0) {
-      auto waitMessage = "{\"status\": \"wait\"}";
-      return get_file_contents(file, waitMessage, strlen(waitMessage));
-   } else if (strncmp(name, "/overflow.json", sizeof("/overflow.json")) == 0) {
-      auto waitMessage = "{\"status\": \"overflow\"}";
-      return get_file_contents(file, waitMessage, strlen(waitMessage));
-   } else if (strncmp(name, "/done.json", sizeof("/done.json")) == 0) {
-      auto doneMessage = "{\"status\": \"done\"}";
-      return get_file_contents(file, doneMessage, strlen(doneMessage));
-   } else if (strncmp(name, "/index.html", sizeof("/index.html")) == 0) {
-      return get_file_contents(file, index_html, strlen(index_html));
-   } else if (strncmp(name, "/fw_upgrade.html", sizeof("/fw_upgrade.html")) == 0) {
-      return get_file_contents(file, fw_upgrade_html, strlen(fw_upgrade_html));
-   } else if (strncmp(name, "/control.js", sizeof("/control.js")) == 0) {
-      return get_file_contents(file, control_js, strlen(control_js));
-   } else if (strncmp(name, "/style.css", sizeof("/style.css")) == 0) {
-      return get_file_contents(file, style_css, strlen(style_css));
-   } else if (strncmp(name, "/filenames.json", sizeof("/filenames.json")) == 0) {
-      return get_file_contents(file, filenames_json, strlen(filenames_json));
-   } else if (strncmp(name, "/nextImage.json", sizeof("/nextImage.json")) == 0) {
-      char *image;
-      if (queue_try_remove(&imageQueue, &image)) {
-         int retVal = get_file_contents(file, image, strlen(image));
-         delete[] image;
-         return retVal;
-      }
-
-      return 0;
-      
-   } else if (strncmp(name, "/version.js", sizeof("/version.js")) == 0) {
-      return get_file_contents(file, version_js, strlen(version_js));
-   } else if (strncmp(name, "/version.json", sizeof("/version.json")) == 0) {
-      return get_file_contents(file, versionJson, strlen(versionJson));
-   } else {
-      printf("Unable to find %s\n", name);
-      return 0;
-   }
+    printf("open custom name: %s\n", name);
+    if (strncmp(name, "/status.json", sizeof("/status.json")) == 0) {
+        // Inject sdPresent into the ZuluSCSI status JSON by stripping the trailing
+        // '}' and appending the field before closing.
+        static char statusBuf[MAX_MSG_SIZE + 32];
+        size_t slen = strlen(currentStatus);
+        if (slen > 0 && currentStatus[slen - 1] == '}') {
+            snprintf(statusBuf, sizeof(statusBuf), "%.*s,\"sdPresent\":%s}",
+                     (int)(slen - 1), currentStatus,
+                     g_sd_present ? "true" : "false");
+        } else {
+            snprintf(statusBuf, sizeof(statusBuf), "{\"sdPresent\":%s}",
+                     g_sd_present ? "true" : "false");
+        }
+        return get_file_contents(file, statusBuf, strlen(statusBuf));
+    } else if (strncmp(name, "/images.json", sizeof("/images.json")) == 0) {
+        return get_file_contents(file, imageJson, strlen(imageJson));
+    } else if (strncmp(name, "/ok.json", sizeof("/ok.json")) == 0) {
+        auto okMessage = "{\"status\": \"ok\"}";
+        return get_file_contents(file, okMessage, strlen(okMessage));
+    } else if (strncmp(name, "/wait.json", sizeof("/wait.json")) == 0) {
+        auto waitMessage = "{\"status\": \"wait\"}";
+        return get_file_contents(file, waitMessage, strlen(waitMessage));
+    } else if (strncmp(name, "/overflow.json", sizeof("/overflow.json")) == 0) {
+        auto overflowMessage = "{\"status\": \"overflow\"}";
+        return get_file_contents(file, overflowMessage, strlen(overflowMessage));
+    } else if (strncmp(name, "/done.json", sizeof("/done.json")) == 0) {
+        auto doneMessage = "{\"status\": \"done\"}";
+        return get_file_contents(file, doneMessage, strlen(doneMessage));
+    } else if (strncmp(name, "/error.json", sizeof("/error.json")) == 0) {
+        auto errorMessage = "{\"status\": \"error\"}";
+        return get_file_contents(file, errorMessage, strlen(errorMessage));
+    } else if (strncmp(name, "/index.html", sizeof("/index.html")) == 0) {
+        return get_file_contents(file, index_html, strlen(index_html));
+    } else if (strncmp(name, "/fw_upgrade.html", sizeof("/fw_upgrade.html")) == 0) {
+        return get_file_contents(file, fw_upgrade_html, strlen(fw_upgrade_html));
+    } else if (strncmp(name, "/control.js", sizeof("/control.js")) == 0) {
+        return get_file_contents(file, control_js, strlen(control_js));
+    } else if (strncmp(name, "/style.css", sizeof("/style.css")) == 0) {
+        return get_file_contents(file, style_css, strlen(style_css));
+    } else if (strncmp(name, "/filenames.json", sizeof("/filenames.json")) == 0) {
+        if (g_filenames_serving_id >= MAX_SCSI_IDS || g_filenames_scsi_id[g_filenames_serving_id] == nullptr)
+            return 0;
+        const char *json = g_filenames_scsi_id[g_filenames_serving_id];
+        return get_file_contents(file, json, strlen(json));
+    } else if (strncmp(name, "/nextImage.json", sizeof("/nextImage.json")) == 0) {
+        char *image;
+        if (queue_try_remove(&imageQueue, &image)) {
+            int retVal = get_file_contents(file, image, strlen(image));
+            delete[] image;
+            return retVal;
+        }
+        return 0;
+    } else if (strncmp(name, "/version.js", sizeof("/version.js")) == 0) {
+        return get_file_contents(file, version_js, strlen(version_js));
+    } else if (strncmp(name, "/version.json", sizeof("/version.json")) == 0) {
+        return get_file_contents(file, versionJson, strlen(versionJson));
+    } else if (strncmp(name, "/devicelist.json", sizeof("/devicelist.json")) == 0) {
+        return get_file_contents(file, deviceListJson, strlen(deviceListJson));
+    } else {
+        printf("Unable to find %s\n", name);
+        return 0;
+    }
 }
 
 void fs_close_custom(struct fs_file *file) {
-   printf("close custom closing file\n");
+    printf("close custom closing file\n");
 }
 
-int fs_read_custom(struct fs_file *file, char *buffer, int count) 
+int fs_read_custom(struct fs_file *file, char *buffer, int count)
 {
-   if (file->index >= file->len)
-      return FS_READ_EOF;
-   int read = (file->len - file->index < count) ? file->len - file->index : count; 
-   memcpy(buffer, (char*) file->pextension + file->index, read);
-   file->index += read;
-   return read;
+    if (file->index >= file->len) return FS_READ_EOF;
+    int read = (file->len - file->index < count) ? file->len - file->index : count;
+    memcpy(buffer, (char*)file->pextension + file->index, read);
+    file->index += read;
+    return read;
 }
