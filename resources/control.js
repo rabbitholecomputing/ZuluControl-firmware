@@ -1,106 +1,278 @@
 var timer;
+var g_deviceType = 'Unknown';
+var g_scsiSelectId = -1;
+var g_scsiSelectType = '';
+var g_iterImgs = [];
 
-function showStatus() {
- document.getElementById('si').setAttribute('class', 'hdn');
- document.getElementById('st').removeAttribute('class');
- setTimeout(refresh, 1500);
-}
-
-document.addEventListener('DOMContentLoaded', (event) => {
+// Restore saved refresh settings once DOM is ready.
+// load_version() (defined below) is invoked by version.js DOMContentLoaded listener.
+document.addEventListener('DOMContentLoaded', function() {
   if (typeof(Storage) !== 'undefined') {
-    let refreshTime = localStorage.getItem('refreshTime');
-    if (refreshTime !== null) {
-      let refreshTimeElm = document.getElementById('rt');
-      refreshTimeElm.value = refreshTime;
-    }
-    let autoRefreshOn = localStorage.getItem('autoRefreshOn');
-    if (autoRefreshOn !== null)
-    {
-      let autoRefreshElm = document.getElementById('ar');
-      autoRefreshElm.checked = !!autoRefreshOn; 
-    }
+    var rt = localStorage.getItem('refreshTime');
+    if (rt) document.getElementById('rt').value = rt;
+    var ar = localStorage.getItem('autoRefreshOn');
+    if (ar !== null) document.getElementById('ar').checked = !!ar;
   }
- autoRefresh();
- refresh()
 });
 
-function ejectClk() {
- fetch('eject')
- .then(r => r.json())
- .then(s => { if (s.status != 'ok') alert('Eject failed.'); else setTimeout(refresh, 1500); });
+// Override the load_version defined in version.js so we can show the right view.
+function load_version() {
+  fetch('version')
+    .then(function(r) { return r.json(); })
+    .then(function(version) {
+      updateVersion(version);
+      g_deviceType = version.deviceType || 'ZuluIDE';
+      showView(g_deviceType);
+      autoRefresh();
+      refresh();
+    });
 }
+
+function showView(devType) {
+  document.getElementById('ctrl-row').removeAttribute('class');
+  document.getElementById('version').removeAttribute('class');
+  if (devType === 'ZuluSCSI') {
+    document.getElementById('scsi-view').removeAttribute('class');
+  } else {
+    document.getElementById('ide-view').removeAttribute('class');
+  }
+}
+
 function refresh() {
- fetch('status')
- .then(response => response.json())
- .then(status => updateStatus(status));
+  fetch('status')
+    .then(function(r) { return r.json(); })
+    .then(function(status) { updateStatus(status); });
 }
+
 function updateStatus(status) {
- let elm = document.getElementById('dt');
-  elm.innerHTML = (status.isPrimary ? 'Primary' : 'Secondary') + ' CD-ROM';
-  elm = document.getElementById('img');
-  elm.innerHTML = status.image ? status.image.filename : '';
+  if (g_deviceType === 'ZuluSCSI') {
+    scsiUpdateStatus(status);
+  } else {
+    ideUpdateStatus(status);
+  }
 }
 
 function autoRefresh() {
- let refreshTimeElm = document.getElementById('rt');
- let interval = parseInt(refreshTimeElm.value, 10);
- let elm = document.getElementById('ar');
- if (typeof(Storage) !== 'undefined') {
-  localStorage.setItem('autoRefreshOn', elm.checked ? 'true' : '');
-  localStorage.setItem('refreshTime', refreshTimeElm.value);
- }
-
- if (elm.checked) {
-  clearTimeout(timer);
-  timer = setInterval(refresh, interval);
- } else if (timer) {
-  clearTimeout(timer);
- }
-}
-
-function selectClk() {
- document.getElementById('st').setAttribute('class', 'hdn');
- document.getElementById('si').setAttribute('class', 'img');
- let ni = document.getElementById('newImg');
- for (let a in ni.options) { ni.options.remove(0); }
- loadFns();
-}
-function cancelClicked() {
- showStatus();
-}
-function loadClicked() {
- let si = document.getElementById('newImg');
- fetch('image?' +  new URLSearchParams({ imageName: si.value}))
- .then(r => r.json())
- .then(s => { 
-  if (s.status != 'ok') alert('Select failed.');});
- showStatus();
-}
-
-var imgs=[];
-function loadFns() {
- fetch('filenames')
- .then(response => response.json())
- .then(fns => {
-  if (fns.status == 'wait') {setTimeout(loadFns, 50);}
-  else if (fns.status == 'overflow') {loadImgs();}
-  else { writeFn(document.getElementById('newImg'), fns);}}); 
-}
-function loadImgs() {
- fetch('nextImage')
- .then(response => response.json())
- .then(image => {
-  if (image.status == 'wait') {setTimeout(loadImgs, 50);}
-  else if (image.status == 'done') { loadImages(document.getElementById('newImg'));}
-  else {imgs.push(image); loadImgs();}});
-}
- function writeFn(ni, fns) {
-  for (let fn of fns.filenames) {
-   ni.add(new Option(fn));
+  var refreshTimeElm = document.getElementById('rt');
+  var interval = parseInt(refreshTimeElm.value, 10);
+  var elm = document.getElementById('ar');
+  if (typeof(Storage) !== 'undefined') {
+    localStorage.setItem('autoRefreshOn', elm.checked ? 'true' : '');
+    localStorage.setItem('refreshTime', refreshTimeElm.value);
+  }
+  if (elm.checked) {
+    clearTimeout(timer);
+    timer = setInterval(refresh, interval);
+  } else if (timer) {
+    clearTimeout(timer);
   }
 }
-function loadImages(ni) {
- for (let i in imgs) {
-  ni.add(new Option(imgs[i].filename));
- }
+
+// ── ZuluIDE ──────────────────────────────────────────────────────────────────
+
+function ideUpdateStatus(status) {
+  var sdElm = document.getElementById('ide-sd');
+  sdElm.innerHTML = status.sdPresent ? 'Present' : 'Not present';
+  sdElm.style.color = status.sdPresent ? '' : 'red';
+  var elm = document.getElementById('ide-dt');
+  elm.innerHTML = (status.isPrimary ? 'Primary' : 'Secondary') + ' CD-ROM';
+  elm = document.getElementById('ide-img');
+  elm.innerHTML = status.image ? status.image.filename : '(no image)';
+}
+
+function ideEjectClk() {
+  fetch('eject')
+    .then(function(r) { return r.json(); })
+    .then(function(s) {
+      if (s.status !== 'ok') alert('Eject failed.');
+      else setTimeout(refresh, 1500);
+    });
+}
+
+function ideSelectClk() {
+  var sdElm = document.getElementById('ide-sd');
+  if (sdElm) {
+    sdElm.innerHTML = status.sdPresent ? 'Present' : 'Not present';
+    sdElm.style.color = status.sdPresent ? '' : 'red';
+  }
+  document.getElementById('ide-st').setAttribute('class', 'hdn');
+  document.getElementById('ide-si').removeAttribute('class');
+  var ni = document.getElementById('ide-newImg');
+  while (ni.options.length) { ni.options.remove(0); }
+  g_iterImgs = [];
+  ideLoadFns();
+}
+
+function ideCancelClicked() {
+  document.getElementById('ide-si').setAttribute('class', 'hdn');
+  document.getElementById('ide-st').removeAttribute('class');
+  setTimeout(refresh, 1500);
+}
+
+function ideLoadClicked() {
+  var si = document.getElementById('ide-newImg');
+  fetch('image?' + new URLSearchParams({ imageName: si.value }))
+    .then(function(r) { return r.json(); })
+    .then(function(s) { if (s.status !== 'ok') alert('Select failed.'); });
+  ideCancelClicked();
+}
+
+function ideLoadFns() {
+  fetch('filenames')
+    .then(function(r) { return r.json(); })
+    .then(function(fns) {
+      if (fns.status === 'wait') { setTimeout(ideLoadFns, 50); }
+      else if (fns.status === 'overflow') { ideLoadImgIter(); }
+      else { ideWriteFn(document.getElementById('ide-newImg'), fns); }
+    });
+}
+
+function ideLoadImgIter() {
+  fetch('nextImage')
+    .then(function(r) { return r.json(); })
+    .then(function(img) {
+      if (img.status === 'wait') { setTimeout(ideLoadImgIter, 50); }
+      else if (img.status === 'done') { ideWriteImgs(document.getElementById('ide-newImg')); }
+      else { g_iterImgs.push(img); ideLoadImgIter(); }
+    });
+}
+
+function ideWriteFn(ni, fns) {
+  for (var i = 0; i < fns.filenames.length; i++) {
+    ni.add(new Option(fns.filenames[i]));
+  }
+}
+
+function ideWriteImgs(ni) {
+  for (var i = 0; i < g_iterImgs.length; i++) {
+    ni.add(new Option(g_iterImgs[i].filename));
+  }
+}
+
+// ── ZuluSCSI ─────────────────────────────────────────────────────────────────
+
+function scsiUpdateStatus(status) {
+  var sdElm = document.getElementById('scsi-sd');
+  if (sdElm) {
+    sdElm.innerHTML = status.sdPresent ? 'Present' : 'Not present';
+    sdElm.style.color = status.sdPresent ? '' : 'red';
+  }
+  var container = document.getElementById('scsi-devices');
+  if (!status || !status.devices) { container.innerHTML = '<p>No devices.</p>'; return; }
+  var html = '';
+  for (var i = 0; i < status.devices.length; i++) {
+    var d = status.devices[i];
+    var img = d.image || '(no image)';
+    var ejLabel = d.ejected ? ' [ejected]' : '';
+    html += '<div class=\'dev-row\'>';
+    html += 'ID ' + d.id + ' (' + d.type + '): <span class=\'wrap\'>' + img + ejLabel + '</span> ';
+    html += '<button data-id=\'' + d.id + '\' class=\'eject-btn\' aria-label=\'Eject\'>&#x23CF;</button>';
+    if (d.image && d.ejected) {
+      html += '<button data-id=\'' + d.id + '\' class=\'insert-btn\'>&#x23F7; Insert</button>';
+    }
+    var typeIcon = 'Select Media';
+    if (d.type === 'Zip' || d.type === 'Removable' || d.type == 'Floppy') {
+      typeIcon = '&#x1F4BE;';
+    } else if (d.type === 'CD-ROM' || d.type === 'MO') {
+      typeIcon = '&#x1F4bF;';
+    } else if (d.type === 'Tape') {
+      typeIcon = '&#x1F4FC;';
+    }
+
+
+    html += '<button data-id=\'' + d.id + '\' data-type=\'' + d.type + '\' class=\'sel-btn\' aria-label=\'Load Media\'>' + typeIcon + '</button>';
+    html += '</div>';
+  }
+  container.innerHTML = html;
+
+  container.querySelectorAll('.eject-btn').forEach(function(btn) {
+    btn.addEventListener('click', function() { scsiEjectClk(parseInt(btn.dataset.id, 10)); });
+  });
+  container.querySelectorAll('.insert-btn').forEach(function(btn) {
+    btn.addEventListener('click', function() { scsiInsertClk(parseInt(btn.dataset.id, 10)); });
+  });
+  container.querySelectorAll('.sel-btn').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      scsiSelectClk(parseInt(btn.dataset.id, 10), btn.dataset.type);
+    });
+  });
+}
+
+function scsiEjectClk(id) {
+  fetch('eject?' + new URLSearchParams({ scsiId: id }))
+    .then(function(r) { return r.json(); })
+    .then(function(s) {
+      if (s.status !== 'ok') alert('Eject failed.');
+      else setTimeout(refresh, 1500);
+    });
+}
+
+function scsiInsertClk(id) {
+  fetch('insertMedia?' + new URLSearchParams({ scsiId: id }))
+    .then(function(r) { return r.json(); })
+    .then(function(s) {
+      if (s.status !== 'ok') alert('Insert failed.');
+      else setTimeout(refresh, 1500);
+    });
+}
+
+function scsiSelectClk(id, type) {
+  g_scsiSelectId = id;
+  g_scsiSelectType = type;
+  g_iterImgs = [];
+  document.getElementById('scsi-devices').setAttribute('class', 'hdn');
+  document.getElementById('scsi-si').removeAttribute('class');
+  document.getElementById('scsi-si-id').innerHTML = id;
+  document.getElementById('scsi-si-type').innerHTML = type;
+  var ni = document.getElementById('scsi-newImg');
+  while (ni.options.length) { ni.options.remove(0); }
+  scsiLoadFns(id);
+}
+
+function scsiCancelClicked() {
+  document.getElementById('scsi-si').setAttribute('class', 'hdn');
+  document.getElementById('scsi-devices').removeAttribute('class');
+  setTimeout(refresh, 1500);
+}
+
+function scsiLoadClicked() {
+  var si = document.getElementById('scsi-newImg');
+  fetch('image?' + new URLSearchParams({ scsiId: g_scsiSelectId, imageName: si.value }))
+    .then(function(r) { return r.json(); })
+    .then(function(s) { if (s.status !== 'ok') alert('Select failed.'); });
+  scsiCancelClicked();
+}
+
+function scsiLoadFns(id) {
+  fetch('filenames?' + new URLSearchParams({ scsiId: id }))
+    .then(function(r) { return r.json(); })
+    .then(function(fns) {
+      if (fns.status === 'wait') { setTimeout(function() { scsiLoadFns(id); }, 50); }
+      else if (fns.status === 'overflow') { scsiLoadImgIter(id); }
+      else { scsiWriteFn(document.getElementById('scsi-newImg'), fns); }
+    });
+}
+
+function scsiLoadImgIter(id) {
+  fetch('nextImage?' + new URLSearchParams({ scsiId: id }))
+    .then(function(r) { return r.json(); })
+    .then(function(img) {
+      if (img.status === 'wait') { setTimeout(function() { scsiLoadImgIter(id); }, 50); }
+      else if (img.status === 'done') { scsiWriteImgs(document.getElementById('scsi-newImg')); }
+      else { g_iterImgs.push(img); scsiLoadImgIter(id); }
+    });
+}
+
+function scsiWriteFn(ni, fns) {
+  for (var i = 0; i < fns.filenames.length; i++) {
+    ni.add(new Option(fns.filenames[i]));
+  }
+}
+
+function scsiWriteImgs(ni) {
+  // Use path as option value (full path needed by controlLoadImage); filename as display text
+  for (var i = 0; i < g_iterImgs.length; i++) {
+    var img = g_iterImgs[i];
+    ni.add(new Option(img.filename, img.path || img.filename));
+  }
 }

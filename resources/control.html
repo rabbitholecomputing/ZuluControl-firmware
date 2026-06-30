@@ -4,50 +4,75 @@
     <meta name='viewport' content='width=device-width, initial-scale=1' />
     <script type='text/javascript' src='version.js'></script>
     <script type='text/javascript' src='control.js'></script>
-    <link rel='stylesheet' href='style.css' />  </head>
+    <link rel='stylesheet' href='style.css' />
+  </head>
   <body>
-    <div class='row'>
-      <div class='column'>
-        <h1>ZuluIDE Control</h1>
-      </div>
-    </div>
-    <div class='row'>
-      <div class='column'>
-        <div id='st'>
-          Image: <span id='img' class='wrap'></span> <br/>
-          <button onclick='ejectClk()'>&#x23CF;</button><button onclick='selectClk()'>&#x1F4bF;</button>
-          <br/>
-          Device Type: <span id='dt'></span>
-          <hr/>
-          <button onclick='refresh()'>Refresh</button><br/>
-          <input type='checkbox' onchange='autoRefresh()' id='ar' checked></input><label class='label-inline' for='ar'>Auto Refresh</label><br/>
-          <select id='rt' onchange='autoRefresh()'>
-            <option value='500'>0.5s</option>
-            <option value='1000'>1s</option>
-            <option value='2000'>2s</option>
-            <option value='3000' selected>3s</option>
-            <option value='10000'>10s</option>
-            <option value='30000'>30s</option>
-            <option value='60000'>1min</option>
-            <option value='300000'>5min</option>
-          </select>
-        </div>
-        <div id='si' class='hdn'>
-          <select id='newImg'>
-          </select><br/>
-          <button class='load' onclick='loadClicked()'>Load</button><button class='cancel' onclick='cancelClicked()' style='float:right;'>Cancel</button>
+
+    <!-- ZuluIDE view -->
+    <div id='ide-view' class='hdn'>
+      <div class='row'>
+        <div class='column'>
+          <h1>ZuluIDE Control</h1>
+          <div>SD Card: <span id='ide-sd'></span></div>
+          <div id='ide-st'>
+            SD Card: <span id='ide-sd'></span><br/>
+            Image: <span id='ide-img' class='wrap'></span><br/>
+            <button onclick='ideEjectClk()'>&#x23CF;</button><button onclick='ideSelectClk()'>&#x1F4bF;</button>
+            <br/>
+            Device Type: <span id='ide-dt'></span>
+          </div>
+          <div id='ide-si' class='hdn'>
+            <select id='ide-newImg'></select><br/>
+            <button class='load' onclick='ideLoadClicked()'>Load</button><button class='cancel' onclick='ideCancelClicked()' style='float:right;'>Cancel</button>
+          </div>
         </div>
       </div>
     </div>
-    <div class='row'>
-      <div class='column'>
-        <div id='version'>
-          <hr/>
-          I2C API version: client <span id='cav'></span>, server <span id='sav'></span>, ZuluIDE HTTP firmware <span id='cfv'></span> <br/>
-          <span id='avm'></span>
-          <a href="fw_upgrade.html">Upgrade...</a>
+
+    <!-- ZuluSCSI view -->
+    <div id='scsi-view' class='hdn'>
+      <div class='row'>
+        <div class='column'>
+          <h1>ZuluSCSI Control</h1>
+          <div>SD Card: <span id='scsi-sd'></span></div>
+          <div id='scsi-devices'></div>
+          <div id='scsi-si' class='hdn'>
+            <h3>Select Image - ID <span id='scsi-si-id'></span> (<span id='scsi-si-type'></span>)</h3>
+            <select id='scsi-newImg'></select><br/>
+            <button class='load' onclick='scsiLoadClicked()'>Load</button><button class='cancel' onclick='scsiCancelClicked()' style='float:right;'>Cancel</button>
+          </div>
         </div>
       </div>
     </div>
+
+    <!-- Shared refresh controls (shown after device type is known) -->
+    <div id='ctrl-row' class='row hdn'>
+      <div class='column'>
+        <hr/>
+        <button onclick='refresh()'>Refresh</button><br/>
+        <input type='checkbox' onchange='autoRefresh()' id='ar' checked></input><label class='label-inline' for='ar'>Auto Refresh</label><br/>
+        <select id='rt' onchange='autoRefresh()'>
+          <option value='500'>0.5s</option>
+          <option value='1000'>1s</option>
+          <option value='2000'>2s</option>
+          <option value='3000' selected>3s</option>
+          <option value='10000'>10s</option>
+          <option value='30000'>30s</option>
+          <option value='60000'>1min</option>
+          <option value='300000'>5min</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- Version info -->
+    <div id='version' class='row hdn'>
+      <div class='column'>
+        <hr/>
+        I2C API version: client <span id='cav'></span>, server <span id='sav'></span>, firmware <span id='cfv'></span><br/>
+        <span id='avm'></span>
+        <a href='fw_upgrade.html'>Upgrade...</a>
+      </div>
+    </div>
+
   </body>
 </html>

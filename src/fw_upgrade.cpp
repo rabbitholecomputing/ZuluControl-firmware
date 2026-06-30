@@ -174,12 +174,8 @@ static bool handle_uf2_block(uf2_block *block)
         g_fwup_state.blocks_received = 0;
         g_fwup_state.num_blocks = block->num_blocks;
 
-        printf("Stopping second core");
+        printf("Stopping second core\n");
         multicore_reset_core1();
-
-        uint32_t total_bytes = block->num_blocks * UF2_PAYLOAD_SIZE;
-        printf("Erasing temp area for %lu bytes\n", total_bytes);
-        erase_flash_area(FW_UPGRADE_TEMP_OFFSET, total_bytes);
     }
     else if (block->block_no != g_fwup_state.blocks_received)
     {
@@ -190,6 +186,15 @@ static bool handle_uf2_block(uf2_block *block)
 
     uint32_t block_offset = block->target_addr - FW_UPGRADE_TARGET_ADDR;
     uint32_t tmp_addr = FW_UPGRADE_TEMP_OFFSET + block_offset;
+
+    // Erase one sector at a time just before it is first needed.
+    // This keeps each interrupt-disabled period under ~50ms instead of
+    // erasing the entire temp area (5+ seconds) upfront on block 0.
+    if (block_offset % FLASH_SECTOR_ERASE_SIZE == 0)
+    {
+        printf("Erasing sector at %lu\n", tmp_addr);
+        erase_flash_area(tmp_addr, FLASH_SECTOR_ERASE_SIZE);
+    }
     printf("Programming UF2 block %lu/%lu to %lu\n", block->block_no, block->num_blocks, tmp_addr);
     if (!program_flash_block(tmp_addr, block->data))
     {
@@ -204,29 +209,35 @@ static bool handle_uf2_block(uf2_block *block)
 
 err_t fwupgrade_post_receive_data(void *connection, struct pbuf *p)
 {
-    uint8_t *data = (uint8_t*)p->payload;
-    printf("fwupgrade_post_receive_data %d 0x%02x 0x%02x\n", (int)p->len, data[0], data[1]);
+    uint8_t *first_byte = (uint8_t*)p->payload;
+    printf("fwupgrade_post_receive_data %d 0x%02x 0x%02x\n", (int)p->tot_len, first_byte[0], first_byte[1]);
 
-    // Process one UF2 block at a time.
-    // For RP2xxx the UF2 blocks are always 512 bytes in size.
-    size_t remain = p->len;
-    while (remain > 0)
+    // Walk every segment in the pbuf chain — lwIP may deliver chained pbufs
+    // after TCP retransmissions, and p->payload/p->len only covers the first segment.
+    for (struct pbuf *q = p; q != NULL; q = q->next)
     {
-        size_t block_remain = sizeof(uf2_block) - g_fwup_state.block_size;
-        size_t to_cpy = (remain > block_remain) ? block_remain : remain;
-        memcpy((uint8_t*)&g_fwup_state.block + g_fwup_state.block_size, data, to_cpy);
-        g_fwup_state.block_size += to_cpy;
-        data += to_cpy;
-        remain -= to_cpy;
+        uint8_t *data = (uint8_t*)q->payload;
+        size_t remain = q->len;
 
-        if (g_fwup_state.block_size == sizeof(uf2_block))
+        while (remain > 0)
         {
-            if (!handle_uf2_block(&g_fwup_state.block))
+            size_t block_remain = sizeof(uf2_block) - g_fwup_state.block_size;
+            size_t to_cpy = (remain > block_remain) ? block_remain : remain;
+            memcpy((uint8_t*)&g_fwup_state.block + g_fwup_state.block_size, data, to_cpy);
+            g_fwup_state.block_size += to_cpy;
+            data += to_cpy;
+            remain -= to_cpy;
+
+            if (g_fwup_state.block_size == sizeof(uf2_block))
             {
-                printf("handle_uf2_block() failed\n");
-                return ERR_VAL;
+                if (!handle_uf2_block(&g_fwup_state.block))
+                {
+                    printf("handle_uf2_block() failed\n");
+                    pbuf_free(p);
+                    return ERR_VAL;
+                }
+                g_fwup_state.block_size = 0;
             }
-            g_fwup_state.block_size = 0;
         }
     }
 
