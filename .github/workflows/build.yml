@@ -1,16 +1,16 @@
-name: Build ZuluIDE-HTTP-PicoW
+name: Build ZuluControl-firmware
 
 on:
   push:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       
       - name: Checkout pico-sdk
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: raspberrypi/pico-sdk
           path: pico-sdk
@@ -33,13 +33,13 @@ jobs:
           cmake --build build
 
       - name: Upload UF2 into build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          path: ${{github.workspace}}/universal_binary/build/zuluide_http_picow.uf2
-          name: ZuluIDE-HTTP-PicoW Pico2W universal binary
+          path: ${{github.workspace}}/universal_binary/build/zulucontrol.uf2
+          name: ZuluControl-firmware universal binary
 
       - name: Upload ELFs into build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           path: ${{github.workspace}}/universal_binary/build/platform_*/*.elf
           name: Debugging symbols
@@ -54,7 +54,7 @@ jobs:
         if: github.ref == 'refs/heads/main'
         run: |
           cd universal_binary/build
-          gh release create  --latest --repo ${GITHUB_REPOSITORY} release-${{steps.date.outputs.date}}-${{github.run_id}} zuluide_http_picow.uf2
+          gh release create  --latest --repo ${GITHUB_REPOSITORY} release-${{steps.date.outputs.date}}-${{github.run_id}} zulucontrol.uf2
 
       - name: Upload to newly created release
         env: 
@@ -63,4 +63,4 @@ jobs:
         run: |
           RELEASE=$(basename ${{github.ref}})
           cd universal_binary/build
-          gh release upload --repo ${GITHUB_REPOSITORY} $RELEASE * zuluide_http_picow.uf2
+          gh release upload --repo ${GITHUB_REPOSITORY} $RELEASE * zulucontrol.uf2
