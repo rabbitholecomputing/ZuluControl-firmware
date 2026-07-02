@@ -264,8 +264,10 @@ function scsiLoadImgIter(id) {
 }
 
 function scsiWriteFn(ni, fns) {
-  for (var i = 0; i < fns.filenames.length; i++) {
-    ni.add(new Option(fns.filenames[i]));
+  const fnOptions = Array.from(fns.filenames);
+  fnOptions.sort((a, b) => a.localeCompare(b)); // Sort filenames alphabetically
+  for (var i = 0; i < fnOptions.length; i++) {
+    ni.add(new Option(fnOptions[i]));
   }
 }
 
