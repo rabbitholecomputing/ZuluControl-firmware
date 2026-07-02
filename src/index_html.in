@@ -21,24 +21,32 @@
 #ifndef INDEX_HTML_H
 #define INDEX_HTML_H
 
-const char index_html[] =  R"(
+const char index_html[] =  R"ZCTRLDELIM(
 @CONTROL_HTML_CONTENT@
-)";
+)ZCTRLDELIM";
 
-const char fw_upgrade_html[] =  R"(
+const char fw_upgrade_html[] =  R"ZCTRLDELIM(
 @FW_UPGRADE_HTML_CONTENT@
-)";
+)ZCTRLDELIM";
 
-const char control_js[] = R"(
+const char slimselect_css[] = R"ZCTRLDELIM(
+@SLIMSELECT_CSS_CONTENT@
+)ZCTRLDELIM";
+
+const char slimselect_js[] = R"ZCTRLDELIM(
+@SLIMSELECT_JS_CONTENT@
+)ZCTRLDELIM";
+
+const char control_js[] = R"ZCTRLDELIM(
 @CONTROL_JS_CONTENT@
-)";
+)ZCTRLDELIM";
 
-const char version_js[] = R"(
+const char version_js[] = R"ZCTRLDELIM(
 @VERSION_JS_CONTENT@
-)";
+)ZCTRLDELIM";
 
-const char style_css[] = R"(
+const char style_css[] = R"ZCTRLDELIM(
 @STYLE_CSS_CONTENT@
-)";
+)ZCTRLDELIM";
 
 #endif

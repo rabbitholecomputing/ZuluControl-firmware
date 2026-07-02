@@ -13,6 +13,26 @@ document.addEventListener('DOMContentLoaded', function() {
     var ar = localStorage.getItem('autoRefreshOn');
     if (ar !== null) document.getElementById('ar').checked = !!ar;
   }
+  if (!window.SlimSelect)
+  {
+    const slimSelectScript = document.createElement('script');
+    slimSelectScript.src = 'slimselect.js'; 
+    slimSelectScript.async = true;
+    slimSelectScript.onload = function() {
+      new SlimSelect({
+        select: '#ide-newImg'});
+      new SlimSelect({
+        select: '#scsi-newImg'});
+    }
+    document.head.appendChild(slimSelectScript);
+  }
+  else
+  {
+    new SlimSelect({
+      select: '#ide-newImg'});
+    new SlimSelect({
+      select: '#scsi-newImg'});
+  }
 });
 
 // Override the load_version defined in version.js so we can show the right view.

@@ -1086,6 +1086,10 @@ int fs_open_custom(struct fs_file *file, const char *name) {
         return get_file_contents(file, index_html, strlen(index_html));
     } else if (strncmp(name, "/fw_upgrade.html", sizeof("/fw_upgrade.html")) == 0) {
         return get_file_contents(file, fw_upgrade_html, strlen(fw_upgrade_html));
+    } else if (strncmp(name, "/slimselect.css", sizeof("/slimselect.css")) == 0) {
+        return get_file_contents(file, slimselect_css, strlen(slimselect_css));
+    } else if (strncmp(name, "/slimselect.js", sizeof("/slimselect.js")) == 0) {
+        return get_file_contents(file, slimselect_js, strlen(slimselect_js));
     } else if (strncmp(name, "/control.js", sizeof("/control.js")) == 0) {
         return get_file_contents(file, control_js, strlen(control_js));
     } else if (strncmp(name, "/style.css", sizeof("/style.css")) == 0) {

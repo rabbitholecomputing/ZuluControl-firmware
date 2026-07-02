@@ -54,6 +54,8 @@ target_include_directories(zulucontrol PRIVATE
 set(RESOURCE_FILES
     ${CMAKE_CURRENT_LIST_DIR}/resources/control.html
     ${CMAKE_CURRENT_LIST_DIR}/resources/fw_upgrade.html
+    ${CMAKE_CURRENT_LIST_DIR}/resources/slimselect.css
+    ${CMAKE_CURRENT_LIST_DIR}/resources/slimselect.js
     ${CMAKE_CURRENT_LIST_DIR}/resources/control.js
     ${CMAKE_CURRENT_LIST_DIR}/resources/version.js
     ${CMAKE_CURRENT_LIST_DIR}/resources/style.css
