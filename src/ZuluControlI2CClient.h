@@ -37,6 +37,8 @@
 
 #define I2C_SERVER_API_VERSION  0x1
 #define I2C_SERVER_WIFI_CONNECT 0x2
+#define I2C_SERVER_UPDATE_FW_REQUEST 0x3   // Server requests the client to start, stop, or abort a firmware upgrade
+#define I2C_SERVER_UPDATE_FW_DATA 0x4      // Server sends a chunk of firmware data to the client
 #define I2C_SERVER_UPDATE_FILENAME_CACHE 0x8
 #define I2C_SERVER_IMAGE_FILENAME 0x9
 #define I2C_SERVER_SYSTEM_STATUS_JSON 0xA
@@ -52,8 +54,17 @@
 #define I2C_SERVER_SD_NOT_PRESENT 0x00
 #define I2C_SERVER_SD_PRESENT     0x01
 
+#define I2C_SERVER_FW_UPGRADE_START 0x00
+#define I2C_SERVER_FW_UPGRADE_FINISH 0x01
+#define I2C_SERVER_FW_UPGRADE_ABORT 0x02
+#define I2C_SERVER_FW_UPGRADE_RETRY 0x03
+
+
 #define I2C_CLIENT_NOOP 0x0
 #define I2C_CLIENT_API_VERSION 0x01
+#define I2C_CLIENT_UPDATE_FW_ACK 0x03
+#define I2C_CLIENT_ACK_SPECIAL_LEN 0xFFFF
+#define I2C_CLIENT_ACK_CRC_UPGRADE_COMPLETE 0x00000000
 #define I2C_CLIENT_FETCH_FILENAMES 0x09
 #define I2C_CLIENT_SUBSCRIBE_STATUS_JSON 0xA
 #define I2C_CLIENT_LOAD_IMAGE 0xB
@@ -86,7 +97,7 @@
 #include <cstring>
 
 namespace zuluide::i2c::client {
-enum class SendState { None,
+enum class ReceiveState { None,
                        SentCommand,
                        SentLength };
 
@@ -100,7 +111,7 @@ typedef struct {
    uint16_t length;
    uint8_t lengthBytes[2];
    uint8_t buffer[MAX_MSG_SIZE];
-   SendState state;
+   ReceiveState state;
 } Packet;
 
 /**
@@ -117,6 +128,15 @@ bool EnqueueRequest(uint8_t request, const char* toSend);
    Enqueues a request with a raw binary payload (used for ZuluSCSI scsi_id-prefixed commands).
  */
 bool EnqueueRequestBinary(uint8_t request, const uint8_t* payload, uint16_t length);
+
+/**
+   Busy-polls (sleeping 1ms between checks) until the outbound message queue
+   has been fully drained by the I2C slave ISR on core1, or timeout_ms
+   elapses. Used by the firmware-upgrade completion path to make sure a
+   final ACK has actually gone out over the wire before core1 -- which
+   drives that ISR -- gets reset.
+ */
+void WaitForOutputQueueDrain(uint32_t timeout_ms);
 
 /**
    Resets the request queue
@@ -215,6 +235,21 @@ bool TryReceive(Packet** packet);
    Executes the message processing and dispatching loop.
  */
 void ProcessMessages();
+
+/**
+   Called when the server requests a firmware upgrade (start/finish/abort/retry).
+ */
+void ProcessUpgradeFirmwareRequest(const uint8_t* message, size_t length);
+
+/**
+   Called when a chunk of ZuluControl-firmware data is received from the server.
+   Computes the chunk's CRC32 in software, stages it (does not flash it yet --
+   see fw_upgrade.h's stage-then-commit design), and acks back the length and
+   CRC32 the client actually received so the server can decide whether to retry.
+ */
+void ProcessUpgradeFirmwareData(const uint8_t* message, size_t length);
+
 }  // namespace zuluide::i2c::client
+
 
 #endif

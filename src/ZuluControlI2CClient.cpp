@@ -20,10 +20,12 @@
  **/
 
 #include "ZuluControlI2CClient.h"
-
+#include "fw_upgrade.h"
+#include <hardware/sync.h>
+#include <pico/time.h>
 namespace zuluide::i2c::client {
 
-static volatile Packet* current = NULL;
+static volatile Packet* current = nullptr;
 static queue_t outputQueue;
 static queue_t inputQueue;
 static queue_t availInputQueue;
@@ -31,7 +33,7 @@ static queue_t availInputQueue;
 static void i2c_slave_handler(i2c_inst_t* i2c, i2c_slave_event_t event) {
    switch (event) {
       case I2C_SLAVE_RECEIVE: {
-         if (current == NULL) {
+         if (current == nullptr) {
             // Get a buffer.
             static bool input_queue_removed = true;
             if (queue_try_remove(&availInputQueue, &current)) {
@@ -44,24 +46,24 @@ static void i2c_slave_handler(i2c_inst_t* i2c, i2c_slave_event_t event) {
             }
          }
 
-         if (current->state == SendState::None) {
+         if (current->state == ReceiveState::None) {
             if (i2c_get_read_available(i2c0) > 0) {
                current->command = i2c_read_byte_raw(i2c0);
-               current->state = SendState::SentCommand;
+               current->state = ReceiveState::SentCommand;
             }
-         } else if (current->state == SendState::SentCommand) {
+         } else if (current->state == ReceiveState::SentCommand) {
             if (current->pos == 0) {
                if (i2c_get_read_available(i2c0) > 1) {
                   // Both length bytes at once.
                   current->lengthBytes[0] = i2c_read_byte_raw(i2c0);
                   current->lengthBytes[1] = i2c_read_byte_raw(i2c0);
-                  current->state = SendState::SentLength;
+                  current->state = ReceiveState::SentLength;
                   current->pos = 0;
                   current->length = (current->lengthBytes[0] << 8) | current->lengthBytes[1];
                   if (current->length == 0) {
                      // We have now received the entire message.
                      queue_try_add(&inputQueue, &current);
-                     current = NULL;
+                     current = nullptr;
                   }
                } else if (i2c_get_read_available(i2c0) > 0) {
                   // Received the first length byte.
@@ -71,17 +73,17 @@ static void i2c_slave_handler(i2c_inst_t* i2c, i2c_slave_event_t event) {
             } else if (i2c_get_read_available(i2c0) > 0) {
                // Received the second length byte.
                current->lengthBytes[1] = i2c_read_byte_raw(i2c0);
-               current->state = SendState::SentLength;
+               current->state = ReceiveState::SentLength;
                current->pos = 0;
                current->length = (current->lengthBytes[0] << 8) | current->lengthBytes[1];
 
                if (current->length == 0) {
                   // We have now received the entire message.
                   queue_try_add(&inputQueue, &current);
-                  current = NULL;
+                  current = nullptr;
                }
             }
-         } else if (current->state == SendState::SentLength) {
+         } else if (current->state == ReceiveState::SentLength) {
             // Read string data.
             while (current->pos < current->length && i2c_get_read_available(i2c0) > 0) {
                current->buffer[current->pos++] = i2c_read_byte_raw(i2c0);
@@ -90,42 +92,43 @@ static void i2c_slave_handler(i2c_inst_t* i2c, i2c_slave_event_t event) {
             if (current->pos == current->length) {
                // We have now received the entire message.
                queue_try_add(&inputQueue, &current);
-               current = NULL;
+               current = nullptr;
             }
          }
 
          break;
       }
       case I2C_SLAVE_REQUEST: {
-         if (current != NULL) {
-            // Reset if a message wasn't received.
+         if (current != nullptr) {
+            // A write transaction was left incomplete (e.g. the master gave up
+            // partway through). Discard it so stale state doesn't get
+            // mistaken for the start of the next message.
             current->length = 0;
             current->pos = 0;
-            current->state = SendState::None;
-
+            current->state = ReceiveState::None;
             memset((void*)current->buffer, 0, MAX_MSG_SIZE);
             queue_try_add(&availInputQueue, &current);
-            current = NULL;
+            current = nullptr;
          }
 
          Packet* toSend;
          if (queue_try_peek(&outputQueue, &toSend)) {
-            if (toSend->state == SendState::None) {
-               i2c_write_raw_blocking(i2c0, &toSend->command, 1);
-               toSend->state = SendState::SentCommand;
-            } else if (toSend->state == SendState::SentCommand) {
-               i2c_write_raw_blocking(i2c0, toSend->lengthBytes, 2);
-               if (toSend->length > 0) {
-                  toSend->state = SendState::SentLength;
-               } else {
+            if (toSend->state == ReceiveState::None) {
+               uint8_t buffer[3];
+               buffer[0] = toSend->command;
+               buffer[1] = toSend->lengthBytes[0];
+               buffer[2] = toSend->lengthBytes[1];
+               i2c_write_raw_blocking(i2c0, buffer, 3);
+               if (toSend->length == 0) {
                   // Cleanup, sent a request without a string payload.
                   if (!queue_try_remove(&outputQueue, &toSend)) {
-                     printf("Unable to remove from queue.");
+                     printf("Unable to remove from queue.\n");
                   }
-
-                  delete toSend;
+                     delete toSend;
+                  } else {
+                  toSend->state = ReceiveState::SentLength;
                }
-            } else if (toSend->state == SendState::SentLength) {
+            } else if (toSend->state == ReceiveState::SentLength) {
                // Send out the message.
                if ((toSend->length - toSend->pos) > BUFFER_LENGTH) {
                   i2c_write_raw_blocking(i2c0, toSend->buffer + toSend->pos, BUFFER_LENGTH);
@@ -141,9 +144,10 @@ static void i2c_slave_handler(i2c_inst_t* i2c, i2c_slave_event_t event) {
             }
          } else {
             // Send NOOP for the
-            i2c_write_byte_raw(i2c0, I2C_CLIENT_NOOP);
+            uint8_t buffer[3] = {0};
+            buffer[0] = I2C_CLIENT_NOOP;
+            i2c_write_raw_blocking(i2c0, buffer, 3);
          }
-
          break;
       }
       case I2C_SLAVE_FINISH: {
@@ -168,7 +172,7 @@ bool EnqueueRequest(uint8_t request) {
    p->length = 0;
    p->command = request;
    p->pos = 0;
-   p->state = SendState::None;
+   p->state = ReceiveState::None;
    if (!queue_try_add(&outputQueue, &p)) {
       delete p;
       return false;
@@ -187,7 +191,7 @@ bool EnqueueRequest(uint8_t request, const char* toSend) {
    p->lengthBytes[0] = p->length >> 8;
    p->lengthBytes[1] = p->length;
    p->pos = 0;
-   p->state = SendState::None;
+   p->state = ReceiveState::None;
    memcpy(p->buffer, toSend, p->length);
    if (!queue_try_add(&outputQueue, &p)) {
       delete p;
@@ -196,7 +200,21 @@ bool EnqueueRequest(uint8_t request, const char* toSend) {
    return true;
 }
 
+void WaitForOutputQueueDrain(uint32_t timeout_ms) {
+   uint32_t start = to_ms_since_boot(get_absolute_time());
+   while (!queue_is_empty(&outputQueue)) {
+      if ((uint32_t)(to_ms_since_boot(get_absolute_time()) - start) >= timeout_ms) {
+         break;
+      }
+      sleep_ms(1);
+   }
+}
+
 bool EnqueueRequestBinary(uint8_t request, const uint8_t* payload, uint16_t length) {
+   if (payload == nullptr) {
+      return false;
+   }
+
    if (queue_is_full(&outputQueue))
    {
       EnqueueRequest(I2C_CLIENT_RESET_QUEUE);
@@ -208,10 +226,8 @@ bool EnqueueRequestBinary(uint8_t request, const uint8_t* payload, uint16_t leng
    p->lengthBytes[0] = p->length >> 8;
    p->lengthBytes[1] = p->length;
    p->pos = 0;
-   p->state = SendState::None;
-   if (length > 0 && payload != nullptr) {
-      memcpy(p->buffer, payload, length);
-   }
+   p->state = ReceiveState::None;
+   memcpy(p->buffer, payload, length);
    if (!queue_try_add(&outputQueue, &p)) {
       delete p;
       return false;
@@ -238,10 +254,21 @@ void Init(uint sdaPin, uint sclPin, uint addr, uint baudrate) {
    i2c_init(i2c0, baudrate);
    i2c_slave_init(i2c0, addr, &i2c_slave_handler);
 
-   // Initalize data structures for synchronizing between I2C interrupt and the main process.
-   queue_init(&outputQueue, sizeof(Packet*), 20);
-   queue_init(&inputQueue, sizeof(zuluide::i2c::client::Packet*), INPUT_BUFFER_COUNT);
-   queue_init(&availInputQueue, sizeof(zuluide::i2c::client::Packet*), INPUT_BUFFER_COUNT);
+   // Initialize data structures for synchronizing between I2C interrupt and the main process.
+   //
+   // Use explicitly claimed spinlocks (from the SDK's reserved "claim free" range) instead of
+   // queue_init()'s default striped-pool allocation. The striped pool only has 8 IDs and is
+   // shared, via round-robin, with everything else in the program that also uses it -
+   // including multicore_lockout's internal mutex, which is lazily initialized on its first
+   // use (during an I2C firmware upgrade's flash erase/program). If that mutex happens to land
+   // on the same physical spinlock number as one of these queues, the queue's synchronization
+   // gets silently corrupted the moment a lockout is used, and it never recovers on its own.
+   int outputSpinlock = spin_lock_claim_unused(true);
+   int inputSpinlock = spin_lock_claim_unused(true);
+   int availSpinlock = spin_lock_claim_unused(true);
+   queue_init_with_spinlock(&outputQueue, sizeof(Packet*), 20, outputSpinlock);
+   queue_init_with_spinlock(&inputQueue, sizeof(zuluide::i2c::client::Packet*), INPUT_BUFFER_COUNT, inputSpinlock);
+   queue_init_with_spinlock(&availInputQueue, sizeof(zuluide::i2c::client::Packet*), INPUT_BUFFER_COUNT, availSpinlock);
 
    for (int i = 0; i < INPUT_BUFFER_COUNT; i++) {
       auto p = new Packet();
@@ -253,7 +280,7 @@ void Cleanup(Packet* packet) {
    // Cleanup buffer and put back into service.
    packet->length = 0;
    packet->pos = 0;
-   packet->state = SendState::None;
+   packet->state = ReceiveState::None;
    memset(packet->buffer, 0, MAX_MSG_SIZE);
    queue_try_add(&availInputQueue, &packet);
 }
@@ -295,6 +322,12 @@ void ProcessMessages() {
          ProcessDeviceList(toRecv->buffer, toRecv->length);
       } else if (Is(toRecv, I2C_SERVER_SD_STATUS_CHANGE)) {
          ProcessSDStatus(toRecv->buffer, toRecv->length);
+      } else if (Is(toRecv, I2C_SERVER_UPDATE_FW_REQUEST)) {
+         ProcessUpgradeFirmwareRequest(toRecv->buffer, toRecv->length);
+      } else if (Is(toRecv, I2C_SERVER_UPDATE_FW_DATA)) {
+         ProcessUpgradeFirmwareData(toRecv->buffer, toRecv->length);
+      } else {
+         printf("Unknown message received: %02X\n", toRecv->command);
       }
 
 
