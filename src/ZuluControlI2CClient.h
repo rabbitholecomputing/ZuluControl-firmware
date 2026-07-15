@@ -22,7 +22,7 @@
 #ifndef ZULU_CONTROL_I2C_CLIENT
 #define ZULU_CONTROL_I2C_CLIENT
 
-#define I2C_API_VERSION "4.0.0"
+#define I2C_API_VERSION "5.0.0"
 
 #ifndef FW_GITHASH
 #define FW_GITHASH ""
