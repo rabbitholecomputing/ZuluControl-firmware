@@ -47,13 +47,14 @@
 #include "url_decode.h"
 
 static const uint I2C_SLAVE_ADDRESS = 0x45;
-static const uint I2C_BAUDRATE = 400000;  // 400 kHz
+static const uint I2C_BAUDRATE = 400000;  // 400 kHz (Fast Mode)
 
 static const uint I2C_SLAVE_SDA_PIN = 0;
 static const uint I2C_SLAVE_SCL_PIN = 1;
 
 static const uint8_t GPIO_BOARD_TYPE = 5;
-static const uint8_t GPIO_MCU_LED    = 26;
+
+extern const uint8_t GPIO_MCU_LED = 26;
 
 static const uint8_t MAX_SCSI_IDS = 16;
 
@@ -132,6 +133,7 @@ enum class State {
     WaitingForConnect,
     WIFIInit,
     WIFIDown,
+    FirmwareUpgradeI2C,
     Normal
 };
 
@@ -502,6 +504,88 @@ void ProcessSDStatus(const uint8_t *message, size_t length)
     printf("SD card %s\n", g_sd_present ? "present" : "not present");
 }
 
+void ProcessUpgradeFirmwareRequest(const uint8_t* message, size_t length) {
+   if (length != 1) {
+      printf("Invalid firmware upgrade request received.\n");
+      return;
+   }
+
+   uint8_t requestType = message[0];
+   switch (requestType) {
+      case I2C_SERVER_FW_UPGRADE_START:
+         printf("Firmware upgrade request received: START\n");
+         fwupgrade_i2c_begin();
+         programState = State::FirmwareUpgradeI2C;
+         break;
+      case I2C_SERVER_FW_UPGRADE_FINISH:
+         printf("Firmware upgrade request received: FINISH\n");
+         fwupgrade_i2c_finished();
+         programState = State::WaitForAPIVersion;
+         break;
+      case I2C_SERVER_FW_UPGRADE_ABORT:
+         printf("Firmware upgrade request received: ABORT\n");
+         fwupgrade_i2c_begin();
+         programState = State::WaitForAPIVersion;
+         break;
+      case I2C_SERVER_FW_UPGRADE_RETRY:
+         // Host detected a CRC/length mismatch on the chunk it just acked --
+         // discard the staged data (it will be resent) without committing it.
+         printf("Firmware upgrade request received: RETRY\n");
+         fwupgrade_i2c_discard_staged();
+         break;
+      default:
+         printf("Unknown firmware upgrade request received: %02X\n", requestType);
+         break;
+   }
+}
+
+// Table-driven software CRC32, reflected CRC-32/ISO-HDLC (aka the
+// zlib/gzip/PNG/Ethernet CRC32), polynomial 0xEDB88320 (the bit-reversed
+// form of 0x04C11DB7), seed 0xFFFFFFFF, final XOR 0xFFFFFFFF -- so the
+// client computes its own CRC in software as it receives each chunk over
+// the ordinary byte-ISR path.
+static uint32_t g_crc32_table[256];
+static bool g_crc32_table_ready = false;
+
+static void Crc32TableInit() {
+   for (uint32_t i = 0; i < 256; i++) {
+      uint32_t c = i;
+      for (int k = 0; k < 8; k++) {
+         c = (c & 1u) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+      }
+      g_crc32_table[i] = c;
+   }
+   g_crc32_table_ready = true;
+}
+
+static uint32_t Crc32(const uint8_t* data, size_t length) {
+   if (!g_crc32_table_ready) Crc32TableInit();
+   uint32_t crc = 0xFFFFFFFFu;
+   for (size_t i = 0; i < length; i++) {
+      crc = g_crc32_table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
+   }
+   return crc ^ 0xFFFFFFFFu;
+}
+
+void ProcessUpgradeFirmwareData(const uint8_t* message, size_t length) {
+   // Implicit confirmation: receiving a *new* chunk means the host got a
+   // matching-CRC ack for the *previous* one and is proceeding, so it's now
+   // safe to commit (flash) the previously staged chunk.
+   fwupgrade_i2c_commit_staged();
+
+   uint32_t crc = Crc32(message, length);
+   fwupgrade_i2c_stage_chunk(message, length);
+
+   uint8_t ackPayload[6];
+   ackPayload[0] = (length >> 8) & 0xFF;
+   ackPayload[1] = length & 0xFF;
+   ackPayload[2] = (crc >> 24) & 0xFF;
+   ackPayload[3] = (crc >> 16) & 0xFF;
+   ackPayload[4] = (crc >> 8) & 0xFF;
+   ackPayload[5] = crc & 0xFF;
+   EnqueueRequestBinary(I2C_CLIENT_UPDATE_FW_ACK, ackPayload, sizeof(ackPayload));
+}
+
 }  // namespace zuluide::i2c::client
 
 // ── CGI handlers ─────────────────────────────────────────────────────────────
@@ -768,6 +852,10 @@ void httpd_post_finished(void *connection, char *response_uri, u16_t response_ur
 // ── Core 1 (I2C slave) ────────────────────────────────────────────────────────
 
 void core1_main() {
+    // Lets core0 safely park us in RAM (via multicore_lockout_start_blocking()) while it
+    // erases/programs flash during an I2C firmware upgrade, instead of us stalling/hanging
+    // trying to fetch code from the flash core0 currently has locked for the erase/program.
+    multicore_lockout_victim_init();
     zuluide::i2c::client::Init(I2C_SLAVE_SDA_PIN, I2C_SLAVE_SCL_PIN, I2C_SLAVE_ADDRESS, I2C_BAUDRATE);
     multicore_fifo_push_blocking(0xbeef);
     while (true) { tight_loop_contents(); }
@@ -858,6 +946,7 @@ int main() {
                         printf("Failed to add request for SSID to output queue\n");
                     }
                     waiting_start = millis();
+                    printf("Waiting for SSID from server");
                 }
                 last_state = programState;
                 zuluide::i2c::client::ProcessMessages();
@@ -986,6 +1075,11 @@ int main() {
                 break;
             }
 
+            case State::FirmwareUpgradeI2C: {
+                last_state = programState;
+                zuluide::i2c::client::ProcessMessages();
+                break;
+            }
             default:
                 last_state = State::Unknown;
                 printf("Error, unknown state.\n");

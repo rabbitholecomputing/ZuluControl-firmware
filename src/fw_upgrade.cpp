@@ -20,10 +20,13 @@
  **/
 
 #include "fw_upgrade.h"
+#include "ZuluControlI2CClient.h"
 #include <hardware/sync.h>
 #include <hardware/flash.h>
+#include <hardware/gpio.h>
 #include <hardware/structs/scb.h>
 #include <pico/multicore.h>
+#include <pico/time.h>
 #include "lwip/apps/fs.h"
 #include "lwip/apps/httpd.h"
 #include "lwip/def.h"
@@ -31,6 +34,11 @@
 #include "lwip/opt.h"
 #include "boot/uf2.h"
 #include <string.h>
+
+// User LED GPIO, defined in main.cpp -- gpio_put() on a pin whose function/
+// direction hasn't been configured (non-board-type-B boards) is a harmless
+// no-op, same assumption the rest of the LED call sites in main.cpp rely on.
+extern const uint8_t GPIO_MCU_LED;
 
 #if PICO_RP2350
 #define UF2_FAMILY_ID RP2350_ARM_S_FAMILY_ID
@@ -54,6 +62,8 @@ static struct {
     uf2_block block;
     uint32_t blocks_received;
     uint32_t num_blocks;
+    uint8_t staged[MAX_MSG_SIZE];
+    size_t staged_len;
 } g_fwup_state;
 
 err_t fwupgrade_post_begin(void *connection, const char *uri, const char *http_request,
@@ -64,8 +74,20 @@ err_t fwupgrade_post_begin(void *connection, const char *uri, const char *http_r
     g_fwup_state.block_size = 0;
     g_fwup_state.blocks_received = 0;
     g_fwup_state.num_blocks = 0;
+    gpio_put(GPIO_MCU_LED, false);
     return ERR_OK;
 }
+
+void fwupgrade_i2c_begin()
+{
+    printf("I2C firmware upgrade begining\n");
+    g_fwup_state.block_size = 0;
+    g_fwup_state.blocks_received = 0;
+    g_fwup_state.num_blocks = 0;
+    g_fwup_state.staged_len = 0;
+    gpio_put(GPIO_MCU_LED, false);
+}
+
 
 // Erase whole flash area before programming it
 __attribute__((section(".time_critical.erase_flash_area")))
@@ -129,8 +151,11 @@ int64_t finish_fw_upgrade(alarm_id_t id, void *user_data)
     while(1);
 }
 
-static bool handle_uf2_block(uf2_block *block)
+static bool handle_uf2_block(uf2_block *block, bool stop_second_core = true)
 {
+    static uint32_t last_progress_log_ms = 0;
+    uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+
     if (block->magic_start0 != UF2_MAGIC_START0 ||
         block->magic_start1 != UF2_MAGIC_START1 ||
         block->magic_end != UF2_MAGIC_END)
@@ -140,13 +165,38 @@ static bool handle_uf2_block(uf2_block *block)
         return false;
     }
 
+    static uint32_t s_last_family_block = UF2_FAMILY_ID;
+    static uint8_t s_dot_count = 0;
+
     if (block->file_size != UF2_FAMILY_ID || !(block->flags & UF2_FLAG_FAMILY_ID_PRESENT))
     {
-        printf("Ignoring block for different family id (expected 0x%08x, got 0x%08lx)\n",
-            UF2_FAMILY_ID, block->file_size);
+        if (s_last_family_block != block->file_size)
+        {
+            printf("Ignoring block for different family id (expected 0x%08x, got 0x%08lx)\n",
+                UF2_FAMILY_ID, block->file_size);
+            s_last_family_block =  block->file_size;
+        }
+        else if ((uint32_t)(now_ms - last_progress_log_ms) >= 2000)
+        {
+            last_progress_log_ms = now_ms;
+            printf(".");
+            if (s_dot_count > 20)
+            {
+                printf("\n");
+                s_dot_count = 0;
+            }
+            else
+            {
+                s_dot_count++;
+            }
+        }
 
         // Continue upload until we get a block for us in a universal binary
         return true;
+    }
+    else
+    {
+        s_dot_count = 0;
     }
 
     if (block->flags & UF2_FLAG_NOT_MAIN_FLASH)
@@ -174,8 +224,11 @@ static bool handle_uf2_block(uf2_block *block)
         g_fwup_state.blocks_received = 0;
         g_fwup_state.num_blocks = block->num_blocks;
 
-        printf("Stopping second core\n");
-        multicore_reset_core1();
+        if (stop_second_core)
+        {
+            printf("Stopping second core\n");
+            multicore_reset_core1();
+        }
     }
     else if (block->block_no != g_fwup_state.blocks_received)
     {
@@ -187,22 +240,36 @@ static bool handle_uf2_block(uf2_block *block)
     uint32_t block_offset = block->target_addr - FW_UPGRADE_TARGET_ADDR;
     uint32_t tmp_addr = FW_UPGRADE_TEMP_OFFSET + block_offset;
 
+    // Core1 lockout (when needed) is acquired once by the caller around the
+    // whole run of blocks in a commit, not per block -- see fwupgrade_i2c_commit_staged.
+
     // Erase one sector at a time just before it is first needed.
     // This keeps each interrupt-disabled period under ~50ms instead of
     // erasing the entire temp area (5+ seconds) upfront on block 0.
     if (block_offset % FLASH_SECTOR_ERASE_SIZE == 0)
     {
-        printf("Erasing sector at %lu\n", tmp_addr);
         erase_flash_area(tmp_addr, FLASH_SECTOR_ERASE_SIZE);
     }
-    printf("Programming UF2 block %lu/%lu to %lu\n", block->block_no, block->num_blocks, tmp_addr);
-    if (!program_flash_block(tmp_addr, block->data))
+    bool program_ok = program_flash_block(tmp_addr, block->data);
+    if (!program_ok)
     {
         printf("Programming UF2 block to temporary flash failed at addr %lu\n", tmp_addr);
         return false;
     }
-    printf("Block programming successful\n");
     g_fwup_state.blocks_received++;
+
+    // Fast LED blink, one toggle per flash block written.
+    gpio_put(GPIO_MCU_LED, (g_fwup_state.blocks_received & 1) != 0);
+
+    // Log progress at most every 2 seconds rather than every block
+    bool last_block = (g_fwup_state.blocks_received == block->num_blocks);
+    if ((uint32_t)(now_ms - last_progress_log_ms) >= 2000 || last_block)
+    {
+        last_progress_log_ms = now_ms;
+        uint32_t percent = block->num_blocks ? (g_fwup_state.blocks_received * 100 / block->num_blocks) : 0;
+        printf("Programming UF2 block %lu/%lu (%lu%%)\n",
+               g_fwup_state.blocks_received, block->num_blocks, percent);
+    }
 
     return true;
 }
@@ -245,6 +312,76 @@ err_t fwupgrade_post_receive_data(void *connection, struct pbuf *p)
     return ERR_OK;
 }
 
+bool fwupgrade_i2c_stage_chunk(const uint8_t *data, size_t length)
+{
+    if (length > sizeof(g_fwup_state.staged))
+    {
+        printf("fwupgrade_i2c_stage_chunk: length %zu exceeds staging buffer\n", length);
+        return false;
+    }
+
+    memcpy(g_fwup_state.staged, data, length);
+    g_fwup_state.staged_len = length;
+    return true;
+}
+
+bool fwupgrade_i2c_commit_staged()
+{
+    if (g_fwup_state.staged_len == 0)
+    {
+        return true;
+    }
+
+    const uint8_t *data = g_fwup_state.staged;
+    size_t remain = g_fwup_state.staged_len;
+    g_fwup_state.staged_len = 0;
+
+    // Core1 (running the I2C slave ISR) is left running during the I2C upgrade
+    // path so it can keep servicing the bus while we flash. Core1 executes from
+    // flash just like core0, so it must be safely parked in RAM (via the lockout
+    // mechanism) for the duration of any erase/program call, or it can stall/hang
+    // fetching an instruction from flash mid-erase. Acquired once here for the
+    // whole staged chunk (all its uf2_blocks) instead of once per block, since
+    // each lockout round trip costs a fixed signalling overhead independent of
+    // how much flash work happens while it's held.
+    bool locked = multicore_lockout_start_timeout_us(2000000);
+    if (!locked) printf("Lockout start failed\n");
+
+    bool ok = true;
+    while (remain > 0)
+    {
+        size_t block_remain = sizeof(uf2_block) - g_fwup_state.block_size;
+        size_t to_cpy = (remain > block_remain) ? block_remain : remain;
+        memcpy((uint8_t*)&g_fwup_state.block + g_fwup_state.block_size, data, to_cpy);
+        g_fwup_state.block_size += to_cpy;
+        data += to_cpy;
+        remain -= to_cpy;
+        if (g_fwup_state.block_size == sizeof(uf2_block))
+        {
+            if (!handle_uf2_block(&g_fwup_state.block, false))  // Don't stop multicore for I2C
+            {
+                printf("handle_uf2_block() failed\n");
+                ok = false;
+                break;
+            }
+            g_fwup_state.block_size = 0;
+        }
+    }
+
+    bool unlocked = multicore_lockout_end_timeout_us(2000000);
+    if (!unlocked) printf("Lockout end failed\n");
+    // multicore_lockout_end_* only confirms core0's own signal was sent, not that
+    // core1 actually finished exiting its wait loop and resumed normal execution.
+    // Give it a guaranteed window to do so before touching it again.
+    sleep_us(1000);
+
+    return ok;
+}
+
+void fwupgrade_i2c_discard_staged()
+{
+    g_fwup_state.staged_len = 0;
+}
 void start_multicore_i2c();
 
 void fwupgrade_post_finished(void *connection, char *response_uri, u16_t response_uri_len)
@@ -254,6 +391,7 @@ void fwupgrade_post_finished(void *connection, char *response_uri, u16_t respons
     {
         printf("fwupgrade interrupted, %lu/%lu blocks done\n",
             g_fwup_state.blocks_received, g_fwup_state.num_blocks);
+        gpio_put(GPIO_MCU_LED, false);
 
         if (g_fwup_state.num_blocks > 0)
         {
@@ -268,6 +406,50 @@ void fwupgrade_post_finished(void *connection, char *response_uri, u16_t respons
 
         // Let lwip post the result and then proceed to copy the firmware to the actual
         // location and reboot.
+        add_alarm_in_ms(500, finish_fw_upgrade, NULL, false);
+    }
+}
+
+
+void fwupgrade_i2c_finished()
+{
+    fwupgrade_i2c_commit_staged();
+
+    if (g_fwup_state.num_blocks == 0 ||
+        g_fwup_state.blocks_received != g_fwup_state.num_blocks)
+    {
+        printf("I2C firmware upgrade interrupted, %lu/%lu blocks done\n",
+            g_fwup_state.blocks_received, g_fwup_state.num_blocks);
+        gpio_put(GPIO_MCU_LED, false);
+
+        if (g_fwup_state.num_blocks > 0)
+        {
+            // We reset multicore so restore it back to operation
+            start_multicore_i2c();
+        }
+    }
+    else
+    {
+        // Tell the host the update succeeded and this device is about to
+        // reboot into it, via a sentinel ACK the host recognizes as
+        // distinct from a normal chunk ack: length 0xFFFF, crc32
+        // 0x00000000. No real chunk ack can ever produce that length --
+        // chunks are capped at I2C_UPGRADE_MAX_CHUNK bytes -- so it can't
+        // be confused with one. Sent through the same ACK command/queue as
+        // a normal chunk ack, so the host's existing
+        // UpgradeZuluControlFwReadAck() reads it with no changes needed.
+        uint8_t sentinelAck[6] = { 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00 };
+        zuluide::i2c::client::EnqueueRequestBinary(I2C_CLIENT_UPDATE_FW_ACK, sentinelAck, sizeof(sentinelAck));
+
+        // Core1 drives the I2C slave ISR that actually puts bytes on the
+        // wire -- give the ACK a chance to be fully sent before resetting
+        // it below, or the host would never see it.
+        zuluide::i2c::client::WaitForOutputQueueDrain(2000);
+
+        printf("I2C firmware upgrade finished. Rebooting\n");
+
+        // location and reboot.
+        multicore_reset_core1();
         add_alarm_in_ms(500, finish_fw_upgrade, NULL, false);
     }
 }

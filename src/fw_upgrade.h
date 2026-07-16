@@ -35,3 +35,24 @@ err_t fwupgrade_post_receive_data(void *connection, struct pbuf *p);
 
 // Called from http_post_finished
 void fwupgrade_post_finished(void *connection, char *response_uri, u16_t response_uri_len);
+
+// These are the functions that upgrade over I2C
+void fwupgrade_i2c_begin();
+
+// Copies `data` (a chunk just received over I2C, not yet confirmed good) into
+// the staging buffer. Pure memcpy + bookkeeping, no flash access -- safe to
+// call from core0's ordinary message-processing loop.
+bool fwupgrade_i2c_stage_chunk(const uint8_t *data, size_t length);
+
+// Runs the per-uf2_block split + handle_uf2_block loop over whatever is
+// currently staged, committing it (erasing/programming flash as needed). A
+// no-op returning true if nothing is staged. Must be called from core0.
+bool fwupgrade_i2c_commit_staged();
+
+// Discards whatever is currently staged without committing it -- used when
+// the host sends RETRY (it detected a CRC/length mismatch on the chunk it
+// just acked, so the client must forget it; it will be resent). Pure
+// bookkeeping, no flash access.
+void fwupgrade_i2c_discard_staged();
+
+void fwupgrade_i2c_finished();
