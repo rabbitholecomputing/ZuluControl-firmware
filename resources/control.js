@@ -13,6 +13,26 @@ document.addEventListener('DOMContentLoaded', function() {
     var ar = localStorage.getItem('autoRefreshOn');
     if (ar !== null) document.getElementById('ar').checked = !!ar;
   }
+  if (!window.SlimSelect)
+  {
+    const slimSelectScript = document.createElement('script');
+    slimSelectScript.src = 'slimselect.js'; 
+    slimSelectScript.async = true;
+    slimSelectScript.onload = function() {
+      new SlimSelect({
+        select: '#ide-newImg'});
+      new SlimSelect({
+        select: '#scsi-newImg'});
+    }
+    document.head.appendChild(slimSelectScript);
+  }
+  else
+  {
+    new SlimSelect({
+      select: '#ide-newImg'});
+    new SlimSelect({
+      select: '#scsi-newImg'});
+  }
 });
 
 // Override the load_version defined in version.js so we can show the right view.
@@ -264,8 +284,10 @@ function scsiLoadImgIter(id) {
 }
 
 function scsiWriteFn(ni, fns) {
-  for (var i = 0; i < fns.filenames.length; i++) {
-    ni.add(new Option(fns.filenames[i]));
+  const fnOptions = Array.from(fns.filenames);
+  fnOptions.sort((a, b) => a.localeCompare(b)); // Sort filenames alphabetically
+  for (var i = 0; i < fnOptions.length; i++) {
+    ni.add(new Option(fnOptions[i]));
   }
 }
 
