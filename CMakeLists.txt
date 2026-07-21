@@ -34,6 +34,22 @@ target_sources(zulucontrol PRIVATE
     src/url_decode.cpp
     src/ZuluControlI2CClient.cpp
     src/fw_upgrade.cpp
+    src/display/framebuffer.cpp
+    src/display/i2c_master_dma.cpp
+    src/display/ssd1306.cpp
+    src/display/gpio_expander.cpp
+    src/display/json_extract.cpp
+    src/display/display_data.cpp
+    src/display/screen.cpp
+    src/display/screen_registry.cpp
+    src/display/splash_screen.cpp
+    src/display/settings_screen.cpp
+    src/display/info_screen.cpp
+    src/display/message_box.cpp
+    src/display/main_screen.cpp
+    src/display/browse_screen.cpp
+    src/display/screen_saver.cpp
+    src/display/display_task.cpp
 )
 
 #pico_enable_stdio_uart(zulucontrol ENABLED)
@@ -102,4 +118,6 @@ target_link_libraries(zulucontrol
         pico_lwip_http
         boot_uf2_headers
         pico_cyw43_arch_lwip_threadsafe_background
+        hardware_i2c
+        hardware_dma
 )

@@ -35,6 +35,8 @@
 #include "ZuluControlI2CClient.h"
 #include "index_html.h"
 #include "fw_upgrade.h"
+#include "webui_data.h"
+#include "display/display_task.h"
 #include "lwip/apps/fs.h"
 #include "lwip/apps/httpd.h"
 #include "lwip/def.h"
@@ -45,6 +47,7 @@
 #include "lwip/dhcp.h"
 #include "pico/cyw43_arch.h"
 #include "url_decode.h"
+#include "ZuluControl_config.h"
 
 static const uint I2C_SLAVE_ADDRESS = 0x45;
 static const uint I2C_BAUDRATE = 400000;  // 400 kHz (Fast Mode)
@@ -62,8 +65,7 @@ static bool g_board_type_b = false;
 
 // ── Device type / SD status ───────────────────────────────────────────────────
 
-enum class DeviceType { Unknown, ZuluIDE, ZuluSCSI };
-static DeviceType g_device_type = DeviceType::Unknown;
+zulucontrol::config::DeviceType g_device_type = zulucontrol::config::DeviceType::Unknown;
 static bool g_sd_present = false;
 
 // ── Filename cache ────────────────────────────────────────────────────────────
@@ -115,6 +117,59 @@ char ipBuffer[32] = {0};
 
 static char versionJson[MAX_MSG_SIZE];
 static char currentStatus[MAX_MSG_SIZE];
+
+// ── Accessors for src/display's read-only view of the cached JSON above (see webui_data.h) ──
+
+const char *GetCurrentStatusJson() { return currentStatus; }
+bool GetSdPresent() { return g_sd_present; }
+const char *GetVersionJson() { return versionJson; }
+const char *GetDeviceListJson() { return deviceListJson; }
+
+const char *GetFilenamesJson(int scsiId)
+{
+    if (scsiId < 0 || scsiId >= (int)MAX_SCSI_IDS)
+        return "";
+    return g_filenames_scsi_id[scsiId] ? g_filenames_scsi_id[scsiId] : "";
+}
+
+bool RequestFilenames(int scsiId)
+{
+    if (g_device_type == zulucontrol::config::DeviceType::ZuluSCSI)
+    {
+        if (scsiId < 0 || scsiId >= (int)MAX_SCSI_IDS)
+            return false;
+
+        // Cache hit: this ID has a valid pointer and no overflow has occurred.
+        if (g_filenames_scsi_id[scsiId] != nullptr && !g_filenames_overflow)
+            return true;
+
+        // A fetch is already in progress for this exact ID -- wait for it.
+        if (g_filenames_active_id == scsiId)
+            return false;
+
+        // Cache miss with no active fetch: request from the server.
+        if (filenameState == FilenameCacheState::Idle || filenameState == FilenameCacheState::Overflow)
+        {
+            g_filenames_active_id = (uint8_t)scsiId;
+            uint8_t payload[1] = {(uint8_t)scsiId};
+            zuluide::i2c::client::EnqueueRequestBinary(I2C_CLIENT_FETCH_FILENAMES, payload, 1);
+        }
+        return false;
+    }
+    else
+    {
+        // ZuluIDE: single-device, always slot 0.
+        if (g_filenames_scsi_id[0] != nullptr && !g_filenames_overflow)
+            return true;
+
+        if (filenameState == FilenameCacheState::Idle)
+        {
+            zuluide::i2c::client::EnqueueRequest(I2C_CLIENT_FETCH_FILENAMES);
+            filenameState = FilenameCacheState::Fetching;
+        }
+        return false;
+    }
+}
 
 // ── WiFi credentials ──────────────────────────────────────────────────────────
 
@@ -234,22 +289,22 @@ void ProcessServerAPIVersion(const uint8_t *message, size_t length)
             size_t name_len = length - (size_t)(parsed_name - (const char*)message);
             if (name_len >= 7 && strncmp(parsed_name, "ZuluSCSI", 8) == 0) {
                 device_name = "ZuluSCSI";
-                g_device_type = DeviceType::ZuluSCSI;
+                g_device_type = zulucontrol::config::DeviceType::ZuluSCSI;
                 printf("Detected device: ZuluSCSI\n");
             } else if (name_len >= 7 && strncmp(parsed_name, "ZuluIDE", 7) == 0) {
                 device_name = "ZuluIDE";
-                g_device_type = DeviceType::ZuluIDE;
+                g_device_type = zulucontrol::config::DeviceType::ZuluIDE;
                 printf("Detected device: ZuluIDE\n");
             }
         } else {
             // No device name - old firmware, assume ZuluIDE
-            g_device_type = DeviceType::ZuluIDE;
+            g_device_type = zulucontrol::config::DeviceType::ZuluIDE;
             printf("No device name in version string, assuming ZuluIDE\n");
         }
     } else {
         strcat(versionJson, ", \"serverAPIVersion\":\"Unknown\"");
         printf("Error: no API version received from server\n");
-        g_device_type = DeviceType::ZuluIDE;
+        g_device_type = zulucontrol::config::DeviceType::ZuluIDE;
     }
 
     strcat(versionJson, ", \"deviceType\":\"");
@@ -264,7 +319,7 @@ void ProcessServerAPIVersion(const uint8_t *message, size_t length)
 
     strcat(versionJson, "}");
     EnqueueRequest(I2C_CLIENT_RESET_QUEUE);
-    if (g_device_type == DeviceType::ZuluSCSI) {
+    if (g_device_type == zulucontrol::config::DeviceType::ZuluSCSI) {
         EnqueueRequest(I2C_CLIENT_API_VERSION, I2C_API_VERSION);
     }
     programState = State::WaitingForSSID;
@@ -285,7 +340,7 @@ void ProcessSystemStatus(const uint8_t *message, size_t length)
 void ProcessUpdateFilenames(const uint8_t *message, size_t length)
 {
     uint8_t incoming_id = 0;  // ZuluIDE always uses slot 0
-    if (g_device_type == DeviceType::ZuluSCSI) {
+    if (g_device_type == zulucontrol::config::DeviceType::ZuluSCSI) {
         incoming_id = (length > 0) ? message[0] : 0xFF;
         if (incoming_id >= MAX_SCSI_IDS) {
             printf("Ignoring filename cache update for invalid SCSI ID %u\n", incoming_id);
@@ -309,7 +364,7 @@ void ProcessUpdateFilenames(const uint8_t *message, size_t length)
     }
 
     printf("Beginning filename cache update for %s ID %u\n",
-           g_device_type == DeviceType::ZuluSCSI ? "SCSI" : "IDE", incoming_id);
+           g_device_type == zulucontrol::config::DeviceType::ZuluSCSI ? "SCSI" : "IDE", incoming_id);
     g_filenames_active_id = incoming_id;
     g_filenames_id_start   = g_filenames_write_ptr;
     filenameState = FilenameCacheState::Start;
@@ -320,7 +375,7 @@ void ProcessFilename(const uint8_t *message, size_t length)
     const uint8_t *data = message;
     size_t data_len = length;
 
-    if (g_device_type == DeviceType::ZuluSCSI) {
+    if (g_device_type == zulucontrol::config::DeviceType::ZuluSCSI) {
         if (length == 0) {
             // fall through - end sentinel for the active ID
         } else {
@@ -385,7 +440,7 @@ void ProcessFilename(const uint8_t *message, size_t length)
 
             g_filenames_scsi_id[g_filenames_active_id] = g_filenames_id_start;
 
-            if (g_device_type == DeviceType::ZuluSCSI) {
+            if (g_device_type == zulucontrol::config::DeviceType::ZuluSCSI) {
                 printf("Cached filenames for SCSI ID %u\n", g_filenames_active_id);
                 g_filenames_active_id = 0xFF;
                 filenameState = FilenameCacheState::Idle;
@@ -402,7 +457,7 @@ void ProcessImage(const uint8_t *message, size_t length)
     const uint8_t *data = message;
     size_t data_len = length;
 
-    if (g_device_type == DeviceType::ZuluSCSI && length > 0) {
+    if (g_device_type == zulucontrol::config::DeviceType::ZuluSCSI && length > 0) {
         // ZuluSCSI payload: [scsi_id][json...]; end sentinel is just [scsi_id] (data_len==0)
         data = message + 1;
         data_len = length - 1;
@@ -601,7 +656,7 @@ static const char *cgi_handler_status(int index, int numParams, char *pcParam[],
 static const char *cgi_handler_filenames(int index, int numParams, char *pcParam[], char *pcValue[]) {
     printf("Filenames CGI requested\n");
 
-    if (g_device_type == DeviceType::ZuluSCSI) {
+    if (g_device_type == zulucontrol::config::DeviceType::ZuluSCSI) {
         uint8_t req_id = 0;
         for (int i = 0; i < numParams; i++) {
             if (strncmp(pcParam[i], "scsiId", 7) == 0) {
@@ -663,7 +718,7 @@ static const char *cgi_handler_filenames(int index, int numParams, char *pcParam
 }
 
 static const char *cgi_handler_imgs(int index, int numParams, char *pcParam[], char *pcValue[]) {
-    if (g_device_type == DeviceType::ZuluSCSI) {
+    if (g_device_type == zulucontrol::config::DeviceType::ZuluSCSI) {
         uint8_t scsi_id = 0;
         for (int i = 0; i < numParams; i++) {
             if (strncmp(pcParam[i], "scsiId", 7) == 0) {
@@ -701,7 +756,7 @@ static const char *cgi_handler_next_image(int index, int numParams, char *pcPara
     }
 
     if (imageState == ImageCacheState::Idle) {
-        if (g_device_type == DeviceType::ZuluSCSI) {
+        if (g_device_type == zulucontrol::config::DeviceType::ZuluSCSI) {
             uint8_t payload[1] = {scsi_id};
             if (!zuluide::i2c::client::EnqueueRequestBinary(I2C_CLIENT_FETCH_ITR_IMAGE, payload, 1)) {
                 printf("Failed to add iterate image to output queue.\n");
@@ -717,7 +772,7 @@ static const char *cgi_handler_next_image(int index, int numParams, char *pcPara
         if (queue_is_empty(&imageQueue)) {
             return "/wait.json";
         } else {
-            if (g_device_type == DeviceType::ZuluSCSI) {
+            if (g_device_type == zulucontrol::config::DeviceType::ZuluSCSI) {
                 uint8_t payload[1] = {scsi_id};
                 if (!zuluide::i2c::client::EnqueueRequestBinary(I2C_CLIENT_FETCH_ITR_IMAGE, payload, 1)) {
                     printf("Failed to add iterate image to output queue.\n");
@@ -750,7 +805,7 @@ static const char *cgi_handler_image(int index, int numParams, char *params[], c
 
     if (image_name == NULL) return "/error.json";
 
-    if (g_device_type == DeviceType::ZuluSCSI) {
+    if (g_device_type == zulucontrol::config::DeviceType::ZuluSCSI) {
         // Prepend scsi_id byte before the path
         size_t path_len = strlen(image_name);
         uint8_t *payload = new uint8_t[1 + path_len];
@@ -767,7 +822,7 @@ static const char *cgi_handler_image(int index, int numParams, char *params[], c
 }
 
 static const char *cgi_handler_eject(int index, int numParams, char *params[], char *values[]) {
-    if (g_device_type == DeviceType::ZuluSCSI) {
+    if (g_device_type == zulucontrol::config::DeviceType::ZuluSCSI) {
         uint8_t scsi_id = 0;
         for (int i = 0; i < numParams; i++) {
             if (strncmp(params[i], "scsiId", 7) == 0) {
@@ -901,6 +956,10 @@ int main() {
 
     start_multicore_i2c();
 
+    if (!zuluide::display::InitDisplayControl()) {
+        printf("Display/control panel not found on i2c1 -- continuing without it.\n");
+    }
+
     if (cyw43_arch_init()) {
         LogMessageToServer(ClientMessage::Type::Normal, "Failed to initialize WiFi interface. WiFi client halting.");
         return 1;
@@ -916,6 +975,8 @@ int main() {
     State last_state = State::Unknown;
 
     while (true) {
+        zuluide::display::DisplayControlTask();
+
         // Startup blink
         if (started_blink) {
             if ((uint32_t)(millis() - start_time) > 500) {

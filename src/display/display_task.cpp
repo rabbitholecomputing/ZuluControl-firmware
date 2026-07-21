@@ -1,0 +1,248 @@
+/**
+ * ZuluIDE™ - Copyright (c) 2026 Rabbit Hole Computing™
+ *
+ * ZuluIDE™ firmware is licensed under the GPL version 3 or any later version.
+ *
+ * https://www.gnu.org/licenses/gpl-3.0.html
+ * ----
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ **/
+
+#include "display_task.h"
+#include "framebuffer.h"
+#include "ssd1306.h"
+#include "gpio_expander.h"
+#include "display_data.h"
+#include "screen_saver.h"
+#include "screen_registry.h"
+#include "screen_type.h"
+#include "splash_screen.h"
+#include "../ZuluControlI2CClient.h"  // FW_VERSION
+#include <hardware/i2c.h>
+#include <pico/time.h>
+#include <cstdio>
+
+namespace zuluide::display {
+
+namespace {
+
+// New bus, independent of the i2c0 slave link to ZuluSCSI/ZuluIDE
+// (GPIO0/1) -- confirmed with the user: same panel hardware as ZuluSCSI's
+// control board (SSD1306 @0x3C + I2C GPIO-expander @0x3F), on i2c1's
+// default SDA/SCL pins.
+constexpr unsigned int kSdaPin = 2;
+constexpr unsigned int kSclPin = 3;
+constexpr unsigned int kBaudrate = 400000;
+constexpr uint8_t kDisplayAddr = 0x3C;
+constexpr uint8_t kExpanderAddr = 0x3F;
+
+// SSD1306 framebuffer pushes (1024 bytes) are large enough to matter to
+// core0's lwIP polling, so they're rate-limited independently of how often
+// screen content is recomputed (cheap, no I2C) -- ~20Hz is plenty for this
+// UI's animation rates (the fastest screen saver ticks every 40ms anyway).
+constexpr uint32_t kPushIntervalMs = 50;
+
+Framebuffer128x64 g_fb;
+Ssd1306Display g_display;
+GpioExpander g_expander(kExpanderAddr);
+DisplayData g_data;
+ScreenSaverController g_screenSaver(&g_fb, &g_display);
+
+uint32_t g_lastPushMs = 0;
+bool g_initialized = false;
+
+uint32_t millis()
+{
+    return to_ms_since_boot(get_absolute_time());
+}
+
+// Boot-time banner sequence, external to SplashScreen itself (which is a
+// "dumb" screen, see splash_screen.h) -- mirrors control.cpp's
+// splashScreenPoll()/ZULUSCSI_UI_START state machine: this project's own
+// firmware version for 1500ms, then the connection status for 1000ms,
+// then move on to Main. Runs exactly once at boot; later visits to Splash
+// (via Settings' "About") don't re-trigger it since g_bootPhase is
+// already Done by then.
+enum class BootPhase
+{
+    ShowVersion,
+    ShowConnectionStatus,
+    Done
+};
+
+BootPhase g_bootPhase = BootPhase::ShowVersion;
+uint32_t g_bootPhaseStartMs = 0;
+
+void tickBootSequence()
+{
+    if (g_bootPhase == BootPhase::Done)
+        return;
+
+    uint32_t elapsed = millis() - g_bootPhaseStartMs;
+
+    if (g_bootPhase == BootPhase::ShowVersion && elapsed > 1500)
+    {
+        g_bootPhase = BootPhase::ShowConnectionStatus;
+        g_bootPhaseStartMs = millis();
+
+        auto *splash = static_cast<SplashScreen *>(GetScreen(DisplayScreenType::Splash));
+        char banner[40];
+        switch (g_data.GetDeviceType())
+        {
+            case DeviceType::ZuluSCSI: snprintf(banner, sizeof(banner), "Connected: ZuluSCSI"); break;
+            case DeviceType::ZuluIDE: snprintf(banner, sizeof(banner), "Connected: ZuluIDE"); break;
+            default: snprintf(banner, sizeof(banner), "Searching..."); break;
+        }
+        splash->setBannerText(banner);
+    }
+    else if (g_bootPhase == BootPhase::ShowConnectionStatus && elapsed > 1000)
+    {
+        g_bootPhase = BootPhase::Done;
+        ChangeScreen(DisplayScreenType::Main);
+    }
+}
+
+// Surfaces the status JSON's sdPresent flag -- real information from
+// ZuluSCSI/ZuluIDE, not a local decision -- as a MessageBox popup whenever
+// it changes, from whatever screen happens to be active (matches
+// MessageBox.h/.cpp's role in the original UI: showing information the
+// device pushed, not just local warnings).
+bool g_sdPresentKnown = false;
+bool g_lastSdPresent = false;
+
+void checkSdStatusChange()
+{
+    if (g_bootPhase != BootPhase::Done)
+        return;  // don't interrupt the boot sequence
+
+    bool nowPresent = g_data.SdPresent();
+    if (!g_sdPresentKnown)
+    {
+        g_lastSdPresent = nowPresent;
+        g_sdPresentKnown = true;
+        return;
+    }
+    if (nowPresent == g_lastSdPresent)
+        return;
+    g_lastSdPresent = nowPresent;
+
+    Screen *active = GetActiveScreen();
+    if (!active || active->screenType() == DisplayScreenType::MessageBox)
+        return;  // don't interrupt a message already showing
+
+    ShowMessage("-- Info --", "SD Card", nowPresent ? "Inserted" : "Removed",
+                active->screenType(), active->getOriginalIndex(), 2000);
+}
+
+void dispatchInput(const InputEvents &events)
+{
+    Screen *active = GetActiveScreen();
+    if (!active)
+        return;
+
+    if (events.rotaryDirection != 0)
+        active->rotaryChange(events.rotaryDirection);
+    if (events.shortPress[(int)Button::Eject])
+        active->shortEjectPress();
+    if (events.shortPress[(int)Button::Insert])
+        active->shortUserPress();
+    if (events.shortPress[(int)Button::Rotary])
+        active->shortRotaryPress();
+    if (events.longPress[(int)Button::Eject])
+        active->longEjectPress();
+    if (events.longPress[(int)Button::Insert])
+        active->longUserPress();
+    if (events.longPress[(int)Button::Rotary])
+        active->longRotaryPress();
+}
+
+bool hasAnyInput(const InputEvents &events)
+{
+    return events.rotaryDirection != 0 ||
+           events.shortPress[0] || events.shortPress[1] || events.shortPress[2] ||
+           events.longPress[0] || events.longPress[1] || events.longPress[2];
+}
+
+}  // namespace
+
+bool InitDisplayControl()
+{
+    if (!g_display.Init(i2c1, kSdaPin, kSclPin, kBaudrate, kDisplayAddr))
+        return false;
+
+    g_screenSaver.SetConfiguredStyle(ScreenSaverType::Random);  // task requirement: default is random selection
+
+    InitScreens(&g_fb, &g_data);
+
+    auto *splash = static_cast<SplashScreen *>(GetScreen(DisplayScreenType::Splash));
+    splash->setBannerText(FW_VERSION);
+    ChangeScreen(DisplayScreenType::Splash);
+    g_bootPhase = BootPhase::ShowVersion;
+    g_bootPhaseStartMs = millis();
+
+    g_initialized = true;
+    return true;
+}
+
+void DisplayControlTask()
+{
+    if (!g_initialized)
+        return;
+
+    g_data.Refresh();
+    tickBootSequence();
+    checkSdStatusChange();
+
+    InputEvents events;
+    bool gotInput = g_expander.Poll(events);
+    bool anyInput = gotInput && hasAnyInput(events);
+    if (anyInput)
+        g_screenSaver.NotifyUserInput();
+
+    bool wasActive = g_screenSaver.IsActive();
+    g_screenSaver.Tick();
+    bool stillActive = g_screenSaver.IsActive();
+
+    if (wasActive && !stillActive)
+    {
+        // Screen saver just exited -- first press only wakes the display
+        // (control.cpp:1341-1386's behavior), and the underlying screen
+        // needs a fresh redraw since its framebuffer content was overwritten.
+        Screen *active = GetActiveScreen();
+        if (active)
+            active->forceDraw();
+    }
+    else if (!wasActive && gotInput)
+    {
+        dispatchInput(events);
+    }
+
+    if (!stillActive)
+    {
+        Screen *active = GetActiveScreen();
+        if (active)
+            active->tick();
+    }
+
+    g_display.Poll();
+
+    uint32_t now = millis();
+    if (!g_display.IsBusy() && (now - g_lastPushMs) >= kPushIntervalMs)
+    {
+        if (g_display.StartPush(g_fb))
+            g_lastPushMs = now;
+    }
+}
+
+}  // namespace zuluide::display
