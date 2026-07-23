@@ -48,6 +48,13 @@ target_sources(zulucontrol PRIVATE
     src/display/message_box.cpp
     src/display/main_screen.cpp
     src/display/browse_screen.cpp
+    src/display/ui_settings.cpp
+    src/display/popup_menu.cpp
+    src/display/menu_screen.cpp
+    src/display/ide_main_screen.cpp
+    src/display/ide_browse_screen.cpp
+    src/display/ide_settings_screen.cpp
+    src/display/about_screen.cpp
     src/display/screen_saver.cpp
     src/display/display_task.cpp
 )

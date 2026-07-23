@@ -28,10 +28,12 @@
 #include "screen_registry.h"
 #include "screen_type.h"
 #include "splash_screen.h"
+#include "ui_settings.h"
 #include "../ZuluControlI2CClient.h"  // FW_VERSION
 #include <hardware/i2c.h>
 #include <pico/time.h>
 #include <cstdio>
+#include <cstring>
 
 namespace zuluide::display {
 
@@ -49,15 +51,25 @@ constexpr uint8_t kExpanderAddr = 0x3F;
 
 // SSD1306 framebuffer pushes (1024 bytes) are large enough to matter to
 // core0's lwIP polling, so they're rate-limited independently of how often
-// screen content is recomputed (cheap, no I2C) -- ~20Hz is plenty for this
+// screen content is recomputed (cheap, no I2C) -- ~30Hz is plenty for this
 // UI's animation rates (the fastest screen saver ticks every 40ms anyway).
-constexpr uint32_t kPushIntervalMs = 50;
+constexpr uint32_t kPushIntervalMs = 33;
 
 Framebuffer128x64 g_fb;
 Ssd1306Display g_display;
 GpioExpander g_expander(kExpanderAddr);
 DisplayData g_data;
 ScreenSaverController g_screenSaver(&g_fb, &g_display);
+
+// Last framebuffer contents actually pushed to the panel. A push chunks the
+// whole 1024-byte frame across ~2.9ms DMA bursts on the shared i2c1 bus, and
+// the rotary encoder can't be read while one of those bursts is streaming --
+// so pushing a frame identical to what's already on screen (e.g. sitting
+// still in a menu) would blind the encoder for ~23ms every kPushIntervalMs
+// for nothing. Only push when the frame has actually changed; a static screen
+// then leaves the bus free for tight, uninterrupted encoder polling.
+uint8_t g_lastPushed[Framebuffer128x64::SIZE_BYTES];
+bool g_havePushed = false;
 
 uint32_t g_lastPushMs = 0;
 bool g_initialized = false;
@@ -201,6 +213,14 @@ void DisplayControlTask()
         return;
 
     g_data.Refresh();
+
+    // Keep the controller's style in sync with the Settings screen's choice
+    // (cheap; decoupled via ui_settings so screens need no controller handle),
+    // and honor a pending "Turn on screen saver" menu request.
+    g_screenSaver.SetConfiguredStyle(GetConfiguredScreenSaver());
+    if (ConsumeScreenSaverNowRequest())
+        g_screenSaver.ForceActivate();
+
     tickBootSequence();
     checkSdStatusChange();
 
@@ -240,8 +260,18 @@ void DisplayControlTask()
     uint32_t now = millis();
     if (!g_display.IsBusy() && (now - g_lastPushMs) >= kPushIntervalMs)
     {
-        if (g_display.StartPush(g_fb))
-            g_lastPushMs = now;
+        // Skip the push entirely when the frame is unchanged, so the encoder
+        // poll above isn't starved by a redundant refresh (see g_lastPushed).
+        bool changed = !g_havePushed ||
+                       memcmp(g_lastPushed, g_fb.buffer, sizeof(g_lastPushed)) != 0;
+        if (changed && g_display.StartPush(g_fb))
+        {
+            memcpy(g_lastPushed, g_fb.buffer, sizeof(g_lastPushed));
+            g_havePushed = true;
+        }
+        // Advance the cadence gate whether or not anything was pushed, so the
+        // comparison itself only runs at kPushIntervalMs, not every loop pass.
+        g_lastPushMs = now;
     }
 }
 

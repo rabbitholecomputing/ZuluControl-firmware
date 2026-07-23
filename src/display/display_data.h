@@ -50,10 +50,17 @@ enum class DeviceType
 struct DeviceInfo
 {
     int id = 0;
-    char type[16] = "Unknown";  // "CD-ROM"/"Removable"/"Floppy"/"MO"/"Tape"/"Zip"/"Unknown"
+    char type[16] = "Unknown";  // ZuluSCSI: "CD-ROM"/"Removable"/"Floppy"/"MO"/"Tape"/"Zip"/"Unknown"
+                                // ZuluIDE: the loaded image's media type ("cdrom"/"zip100"/
+                                // "zip250"/"zip750"/"harddrive"/"removable"/"unknown"), or
+                                // "ZuluIDE" when nothing is loaded -- see parseStatus().
     char image[MAX_FILE_PATH] = "";  // currently loaded image filename, "" if ejected/none
     bool ejected = true;
     bool present = false;
+    // ZuluIDE only: the status JSON's "isPrimary" flag (primary vs. secondary
+    // IDE device -- shown as "pri"/"sec" on the ZuluIDE main screen). Always
+    // true / unused on ZuluSCSI.
+    bool primary = true;
 };
 
 // One entry in the combined filename index (see DisplayData::MAX_FILENAME_INDEX):

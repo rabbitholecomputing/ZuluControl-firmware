@@ -47,6 +47,16 @@ constexpr uint8_t SSD1306_SETSTARTLINE = 0x40;
 constexpr uint8_t SSD1306_DEACTIVATE_SCROLL = 0x2E;
 constexpr uint8_t SSD1306_COLUMNADDR = 0x21;
 constexpr uint8_t SSD1306_PAGEADDR = 0x22;
+
+// One SSD1306 GDDRAM page per DMA burst -- keeps each transfer short enough
+// (~2.9ms at 400kHz vs ~23ms for the full 1024-byte frame) that the shared
+// I2C1 bus's rotary-encoder poll isn't starved for a whole frame's worth of
+// quadrature transitions. The controller's column/page address counters
+// auto-increment across separate write transactions (set up once in Init()
+// via SSD1306_PAGEADDR/SSD1306_COLUMNADDR covering the full screen), so
+// splitting the stream into several writes produces the same GDDRAM layout
+// as one continuous write.
+constexpr size_t kChunkBytes = Framebuffer128x64::WIDTH;
 }  // namespace
 
 bool Ssd1306Display::sendCommandsBlocking(const uint8_t *cmds, size_t n)
@@ -111,19 +121,66 @@ bool Ssd1306Display::Init(i2c_inst_t *i2c, unsigned int sdaPin, unsigned int scl
     return true;
 }
 
+bool Ssd1306Display::startNextChunk()
+{
+    size_t remaining = Framebuffer128x64::SIZE_BYTES - _pushOffset;
+    size_t n = remaining < kChunkBytes ? remaining : kChunkBytes;
+    return I2CMasterDmaStartWrite(_addr, 0x40, _pushFb->buffer + _pushOffset, n);
+}
+
 bool Ssd1306Display::StartPush(const Framebuffer128x64 &fb)
 {
-    return I2CMasterDmaStartWrite(_addr, 0x40, fb.buffer, Framebuffer128x64::SIZE_BYTES);
+    if (_pushFb != nullptr)
+        return false;  // previous frame still streaming out
+
+    _pushFb = &fb;
+    _pushOffset = 0;
+    return startNextChunk();
 }
 
 bool Ssd1306Display::Poll()
 {
-    return I2CMasterDmaPoll();
+    if (_pushFb == nullptr)
+        return true;  // no push in progress
+
+    if (I2CMasterDmaIsBusy())
+    {
+        bool ok = false;
+        if (!I2CMasterDmaPoll(&ok))
+            return false;  // current page still in flight
+
+        if (!ok)
+        {
+            // Abort the whole frame on a transfer error rather than getting
+            // stuck with a stale column/page pointer mid-frame.
+            _pushFb = nullptr;
+            _pushOffset = 0;
+            return true;
+        }
+
+        _pushOffset += kChunkBytes;
+        if (_pushOffset >= Framebuffer128x64::SIZE_BYTES)
+        {
+            _pushFb = nullptr;
+            _pushOffset = 0;
+            return true;  // whole frame done
+        }
+
+        // This page just finished -- leave the bus idle for the rest of
+        // this call so the caller's (already-run) encoder poll, and any
+        // further work this main-loop iteration, aren't competing with the
+        // next page's DMA. The next page starts on a later Poll() call.
+        return false;
+    }
+
+    // Not busy but a push is pending: between pages. Start the next one.
+    startNextChunk();
+    return false;
 }
 
 bool Ssd1306Display::IsBusy()
 {
-    return I2CMasterDmaIsBusy();
+    return _pushFb != nullptr;
 }
 
 void Ssd1306Display::SetContrast(uint8_t contrast)

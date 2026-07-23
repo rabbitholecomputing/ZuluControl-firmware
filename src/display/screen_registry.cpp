@@ -27,6 +27,12 @@
 #include "info_screen.h"
 #include "message_box.h"
 #include "placeholder_screens.h"
+#include "ide_main_screen.h"
+#include "ide_browse_screen.h"
+#include "ide_settings_screen.h"
+#include "about_screen.h"
+#include "menu_screen.h"
+#include "../ZuluControl_config.h"  // g_device_type
 
 namespace zuluide::display {
 
@@ -42,6 +48,18 @@ SettingsScreen *g_settings = nullptr;
 InfoScreen *g_info = nullptr;
 MessageBox *g_messageBox = nullptr;
 
+// ZuluIDE variants of Main/Browse/Settings -- GetScreen() returns these
+// instead of the SCSI-oriented screens above when the connected device is a
+// ZuluIDE (see the DisplayScreenType::Main/Browse/Settings cases). Both sets
+// are always allocated; which one is live is a per-request check on
+// g_device_type, so a device detected/redetected at runtime picks the right
+// UI without re-initializing the registry.
+IDEMainScreen *g_ideMain = nullptr;
+IDEBrowseScreen *g_ideBrowse = nullptr;
+IDESettingsScreen *g_ideSettings = nullptr;
+AboutScreen *g_about = nullptr;
+MenuScreen *g_menu = nullptr;
+
 PlaceholderScreen *g_infoPage2 = nullptr;
 PlaceholderScreen *g_infoPage3 = nullptr;
 PlaceholderScreen *g_infoPage4 = nullptr;
@@ -49,6 +67,11 @@ PlaceholderScreen *g_browseType = nullptr;
 PlaceholderScreen *g_copy = nullptr;
 PlaceholderScreen *g_initiatorMain = nullptr;
 PlaceholderScreen *g_noControlsError = nullptr;
+
+bool isIde()
+{
+    return g_device_type == zulucontrol::config::DeviceType::ZuluIDE;
+}
 
 }  // namespace
 
@@ -60,6 +83,12 @@ void InitScreens(Framebuffer128x64 *fb, DisplayData *data)
     static SettingsScreen settings(fb, data, &splash);
     static InfoScreen info(fb, data);
     static MessageBox messageBox(fb);
+
+    static IDEMainScreen ideMain(fb, data);
+    static IDEBrowseScreen ideBrowse(fb, data);
+    static IDESettingsScreen ideSettings(fb, data);
+    static AboutScreen about(fb);
+    static MenuScreen menu(fb);
 
     static PlaceholderScreen infoPage2(fb, DisplayScreenType::InfoPage2);
     static PlaceholderScreen infoPage3(fb, DisplayScreenType::InfoPage3);
@@ -75,6 +104,11 @@ void InitScreens(Framebuffer128x64 *fb, DisplayData *data)
     g_settings = &settings;
     g_info = &info;
     g_messageBox = &messageBox;
+    g_ideMain = &ideMain;
+    g_ideBrowse = &ideBrowse;
+    g_ideSettings = &ideSettings;
+    g_about = &about;
+    g_menu = &menu;
     g_infoPage2 = &infoPage2;
     g_infoPage3 = &infoPage3;
     g_infoPage4 = &infoPage4;
@@ -89,10 +123,12 @@ Screen *GetScreen(DisplayScreenType type)
     switch (type)
     {
         case DisplayScreenType::Splash: return g_splash;
-        case DisplayScreenType::Main: return g_main;
-        case DisplayScreenType::Browse: return g_browse;
-        case DisplayScreenType::Settings: return g_settings;
+        case DisplayScreenType::Main: return isIde() ? (Screen *)g_ideMain : (Screen *)g_main;
+        case DisplayScreenType::Browse: return isIde() ? (Screen *)g_ideBrowse : (Screen *)g_browse;
+        case DisplayScreenType::Settings: return isIde() ? (Screen *)g_ideSettings : (Screen *)g_settings;
         case DisplayScreenType::Info: return g_info;
+        case DisplayScreenType::About: return g_about;
+        case DisplayScreenType::Menu: return g_menu;
         case DisplayScreenType::InfoPage2: return g_infoPage2;
         case DisplayScreenType::InfoPage3: return g_infoPage3;
         case DisplayScreenType::InfoPage4: return g_infoPage4;

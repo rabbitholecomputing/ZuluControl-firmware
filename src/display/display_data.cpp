@@ -151,14 +151,28 @@ void DisplayData::parseStatus()
     }
     else if (_deviceType == DeviceType::ZuluIDE)
     {
+        // Single implicit device -- ZuluIDE's status JSON shape is
+        // {"isPrimary":bool,"isCardPresent":bool,...,"image":{"filename":..,
+        // "size":..,"type":".."}} (system_status.cpp's ToJson()).
         DeviceInfo &dev = _devices[0];
         dev.id = 0;
         dev.present = true;
         strncpy(dev.type, "ZuluIDE", sizeof(dev.type) - 1);
 
+        bool primary = true;
+        json::FindBool(json, len, "isPrimary", &primary);
+        dev.primary = primary;
+
         size_t objStart, objLen;
         if (json::FindObject(json, len, "image", &objStart, &objLen))
+        {
             json::FindString(json + objStart, objLen, "filename", dev.image, sizeof(dev.image));
+            // Media type of the loaded image drives the header icon (see
+            // IconForIdeImageType) -- only meaningful while something is
+            // loaded, so type falls back to "ZuluIDE" when ejected below.
+            if (dev.image[0] != '\0')
+                json::FindString(json + objStart, objLen, "type", dev.type, sizeof(dev.type));
+        }
 
         dev.ejected = (dev.image[0] == '\0');
     }

@@ -68,6 +68,19 @@ public:
 
     bool IsActive() const { return _active; }
 
+    // Immediately activates the screen saver (the "Turn on screen saver"
+    // menu action), as if the idle timeout had just elapsed. No-op if it's
+    // already active. The next user input exits it the same as a normal
+    // activation.
+    void ForceActivate()
+    {
+        if (_active)
+            return;
+        _active = true;
+        _timerStarted = false;
+        enter();
+    }
+
     // Advances idle-timer bookkeeping and, while active, the current
     // style's animation. Returns true if it drew this tick (the
     // framebuffer changed and should be pushed to hardware).

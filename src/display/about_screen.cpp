@@ -19,32 +19,29 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  **/
 
-#include "splash_screen.h"
+#include "about_screen.h"
 #include "screen_registry.h"
 #include "icons.h"
+#include "../ZuluControlI2CClient.h"  // I2C_API_VERSION
 #include "../ZuluControl_config.h"
 #include <cstdio>
-#include <cstring>
 
 namespace zuluide::display {
 
-void SplashScreen::init(int index)
+void AboutScreen::init(int index)
 {
     Screen::init(index);
     forceDraw();
 }
 
-void SplashScreen::setBannerText(const char *text)
+void AboutScreen::draw()
 {
-    snprintf(_bannerText, sizeof(_bannerText), "%s", text);
-    forceDraw();
-}
-
-void SplashScreen::draw()
-{
-    switch(g_device_type)
+    // Logo by device type -- same selection SplashScreen makes. There is no
+    // dedicated ZuluIDE logo bitmap in icons.h (only ZuluControl and ZuluSCSI
+    // logos exist), so a ZuluIDE device falls through to the ZuluControl logo.
+    switch (g_device_type)
     {
-        case zulucontrol::config::DeviceType::ZuluSCSI :
+        case zulucontrol::config::DeviceType::ZuluSCSI:
             _fb->drawBitmap(6, 0, icon_zulu_scsi_logo, 115, 56);
             break;
         case zulucontrol::config::DeviceType::ZuluIDE:
@@ -54,12 +51,19 @@ void SplashScreen::draw()
             _fb->drawBitmap(6, 0, icon_zulu_control_logo, 115, 56);
     }
 
-    printCenteredText(_bannerText, 56);
+    char banner[40];
+    snprintf(banner, sizeof(banner), "I2C API v%s", I2C_API_VERSION);
+    printCenteredText(banner, 56);
 }
 
-void SplashScreen::shortUserPress()
+void AboutScreen::dismiss()
 {
-    ChangeScreen(DisplayScreenType::Settings, -1);
+    ChangeScreen(DisplayScreenType::Main, -1);
 }
+
+void AboutScreen::shortUserPress() { dismiss(); }
+void AboutScreen::shortEjectPress() { dismiss(); }
+void AboutScreen::shortRotaryPress() { dismiss(); }
+void AboutScreen::rotaryChange(int) { dismiss(); }
 
 }  // namespace zuluide::display

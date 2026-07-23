@@ -42,11 +42,21 @@ public:
     // other bus traffic, same as the original control.cpp's initScreenHardware()).
     bool Init(i2c_inst_t *i2c, unsigned int sdaPin, unsigned int sclPin, unsigned int baudrate, uint8_t addr);
 
-    // Starts an async push of the framebuffer's 1024 bytes. Returns false
-    // if a previous push is still in flight (call Poll() until true).
+    // Starts an async push of the framebuffer, one page (128 bytes) at a
+    // time rather than all 1024 bytes in a single DMA burst -- see Poll()
+    // for why. Returns false if a previous push is still in flight (call
+    // Poll() until true).
     bool StartPush(const Framebuffer128x64 &fb);
 
-    // Call every tick while a push is in flight; true once it has finished.
+    // Call every tick while a push is in flight; true once the whole frame
+    // has finished. Services the current page's DMA transfer and, once it
+    // completes, leaves the bus idle for this call -- the next page isn't
+    // started until a *later* Poll() call. This gives the main loop's
+    // GpioExpander::Poll() (which shares this same I2C1 bus/DMA channels
+    // and runs before this in DisplayControlTask()) a guaranteed window
+    // between pages instead of being locked out for the whole ~23ms/1024-byte
+    // transfer -- each page is ~1/8th that, capping the encoder's blind
+    // window at a single page instead of a whole frame.
     bool Poll();
     bool IsBusy();
 
@@ -60,6 +70,13 @@ private:
     uint8_t _addr = 0x3C;
     uint8_t _contrast = 0xCF;
 
+    // Multi-page push state -- non-null buffer pointer means a push spanning
+    // possibly-many Poll() calls is in progress; _pushOffset is the byte
+    // offset of the next page still to send.
+    const Framebuffer128x64 *_pushFb = nullptr;
+    size_t _pushOffset = 0;
+
+    bool startNextChunk();
     bool sendCommandsBlocking(const uint8_t *cmds, size_t n);
 };
 

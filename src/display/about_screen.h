@@ -19,38 +19,35 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  **/
 
-// Mirrors ZuluSCSI-firmware's lib/ZuluSCSI_UI_RP2MCU/ScreenType.h so the
-// factory/registry shape is complete for the next iteration. Splash/Main/
-// Browse are implemented this iteration (screen_registry.cpp); every other
-// value is registered against a stub PlaceholderScreen (placeholder_screens.h)
-// that no navigation path in this iteration ever reaches.
+// About screen for the ZuluIDE UI (DisplayScreenType::About) -- reached from
+// the main popup menu's "About" entry. Draws the logo (by device type, same
+// as SplashScreen) plus the I2C API version banner, and returns to Main on
+// ANY button/rotary input (task spec). Distinct from SplashScreen, whose
+// shortUserPress() opens Settings and which the boot sequence drives.
 
 #pragma once
 
+#include "screen.h"
+
 namespace zuluide::display {
 
-enum class DisplayScreenType
+class AboutScreen : public Screen
 {
-    None,
-    Splash,
-    Settings,
-    Main,
-    Info,
-    InfoPage2,
-    InfoPage3,
-    InfoPage4,
-    BrowseType,
-    Browse,
-    MessageBox,
-    Copy,
-    InitiatorMain,
-    NoControlsError,
-    // Not part of ZuluSCSI_UI_RP2MCU's ScreenType -- added for the ZuluIDE
-    // UI's "About" entry (logo + I2C API version, dismissed by any button).
-    About,
-    // Shared, configurable scrollable-list menu screen (see menu_screen.h),
-    // switched to via ShowMenu() the way MessageBox is via ShowMessage().
-    Menu,
+public:
+    explicit AboutScreen(Framebuffer128x64 *fb) : Screen(fb) {}
+
+    DisplayScreenType screenType() const override { return DisplayScreenType::About; }
+
+    void init(int index) override;
+    void draw() override;
+
+    void shortUserPress() override;
+    void shortEjectPress() override;
+    void shortRotaryPress() override;
+    void rotaryChange(int direction) override;
+
+private:
+    void dismiss();
 };
 
 }  // namespace zuluide::display
