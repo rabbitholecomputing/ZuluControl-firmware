@@ -32,6 +32,7 @@
 #include "ide_settings_screen.h"
 #include "about_screen.h"
 #include "menu_screen.h"
+#include "firmware_upgrade_screen.h"
 #include "../ZuluControl_config.h"  // g_device_type
 
 namespace zuluide::display {
@@ -64,7 +65,7 @@ PlaceholderScreen *g_infoPage2 = nullptr;
 PlaceholderScreen *g_infoPage3 = nullptr;
 PlaceholderScreen *g_infoPage4 = nullptr;
 PlaceholderScreen *g_browseType = nullptr;
-PlaceholderScreen *g_copy = nullptr;
+FirmwareUpgradeScreen *g_copy = nullptr;
 PlaceholderScreen *g_initiatorMain = nullptr;
 PlaceholderScreen *g_noControlsError = nullptr;
 
@@ -94,7 +95,7 @@ void InitScreens(Framebuffer128x64 *fb, DisplayData *data)
     static PlaceholderScreen infoPage3(fb, DisplayScreenType::InfoPage3);
     static PlaceholderScreen infoPage4(fb, DisplayScreenType::InfoPage4);
     static PlaceholderScreen browseType(fb, DisplayScreenType::BrowseType);
-    static PlaceholderScreen copy(fb, DisplayScreenType::Copy);
+    static FirmwareUpgradeScreen copy(fb);
     static PlaceholderScreen initiatorMain(fb, DisplayScreenType::InitiatorMain);
     static PlaceholderScreen noControlsError(fb, DisplayScreenType::NoControlsError);
 

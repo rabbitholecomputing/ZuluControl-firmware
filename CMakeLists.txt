@@ -55,6 +55,7 @@ target_sources(zulucontrol PRIVATE
     src/display/ide_browse_screen.cpp
     src/display/ide_settings_screen.cpp
     src/display/about_screen.cpp
+    src/display/firmware_upgrade_screen.cpp
     src/display/screen_saver.cpp
     src/display/display_task.cpp
 )
@@ -72,6 +73,7 @@ target_link_options(zulucontrol PRIVATE "-Wl,--print-memory-usage")
 
 target_include_directories(zulucontrol PRIVATE
         ${CMAKE_CURRENT_LIST_DIR}/src
+        ${CMAKE_CURRENT_BINARY_DIR}/generated
         )
 
 set(RESOURCE_FILES
@@ -94,7 +96,7 @@ endforeach()
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${RESOURCE_FILES})
 configure_file(
     ${CMAKE_CURRENT_LIST_DIR}/src/index_html.in
-    ${CMAKE_CURRENT_LIST_DIR}/src/index_html.h
+    ${CMAKE_CURRENT_BINARY_DIR}/generated/index_html.h
     @ONLY
 )
 

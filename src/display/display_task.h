@@ -45,4 +45,16 @@ bool InitDisplayControl();
 // and connection status can render before State::Normal is reached).
 void DisplayControlTask();
 
+// Renders and pushes the "Firmware Upgrade" progress screen synchronously,
+// once (subject to an internal throttle), reading fwupgrade_get_status().
+// A no-op unless an upgrade is active. Meant to be called from BOTH core0's
+// main loop (which drives the I2C upgrade path) AND, crucially, the lwIP
+// background context that services a web (HTTP POST) upload -- during which
+// the main loop is starved, so DisplayControlTask() alone would leave the
+// bar frozen. A reentrancy/bus-ownership guard makes the two callers safe:
+// whichever enters first owns i2c1 for its blocking push; the other returns
+// immediately. Safe to call before InitDisplayControl() (no-op) and when no
+// panel is present.
+void PumpFirmwareUpgradeDisplay();
+
 }  // namespace zuluide::display

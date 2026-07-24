@@ -579,7 +579,7 @@ void ProcessUpgradeFirmwareRequest(const uint8_t* message, size_t length) {
          break;
       case I2C_SERVER_FW_UPGRADE_ABORT:
          printf("Firmware upgrade request received: ABORT\n");
-         fwupgrade_i2c_begin();
+         fwupgrade_i2c_abort();
          programState = State::WaitForAPIVersion;
          break;
       case I2C_SERVER_FW_UPGRADE_RETRY:

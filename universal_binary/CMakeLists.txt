@@ -10,7 +10,7 @@
 # cmake -B build; cmake --build build
 
 cmake_minimum_required(VERSION 3.25)
-project(zulucontrol_universal C CXX ASM)
+project(zulucontrol_universal LANGUAGES NONE)
 include(ExternalProject)
 
 ExternalProject_Add(platform_picow
@@ -18,7 +18,9 @@ ExternalProject_Add(platform_picow
             BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR}/platform_picow
             CMAKE_ARGS
                 "-DPICO_BOARD=pico_w"
+                "-DCMAKE_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}"
             BUILD_ALWAYS 1 # force dependency checking
+            BUILD_BYPRODUCTS ${CMAKE_CURRENT_BINARY_DIR}/platform_picow/zulucontrol.uf2
             INSTALL_COMMAND ""
 )
 
@@ -27,7 +29,9 @@ ExternalProject_Add(platform_pico2w
             BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR}/platform_pico2w
             CMAKE_ARGS
                 "-DPICO_BOARD=pico2_w"
+                "-DCMAKE_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}"
             BUILD_ALWAYS 1 # force dependency checking
+            BUILD_BYPRODUCTS ${CMAKE_CURRENT_BINARY_DIR}/platform_pico2w/zulucontrol.uf2
             INSTALL_COMMAND ""
 )
 
