@@ -21,6 +21,8 @@
 
 #include "browse_screen.h"
 #include "screen_registry.h"
+#include "menu_screen.h"
+#include "ui_settings.h"
 #include "icons.h"
 #include "../ZuluControlI2CClient.h"
 #include "../ZuluControl_config.h"
@@ -51,6 +53,25 @@ constexpr int kScrollW = Framebuffer128x64::WIDTH - kScrollX;
 constexpr int kScrollStepPx = 3;
 constexpr uint32_t kScrollIntervalMs = 360;
 constexpr uint32_t kScrollPauseMs = 1000;
+
+// Browse-menu actions (stored per-item in _menuActions, since the item list is
+// built dynamically in buildMenu()).
+enum { kActSelect = 0, kActClose, kActMap, kActInfo, kActScroll1, kActScroll10, kActScroll50 };
+
+// Single tag for the browse menu passed to ShowMenu().
+constexpr int kMenuBrowse = 0;
+constexpr int kMenuScale = 1;
+
+// Virtual list entry shown at the ring's wrap point (cursor index == image
+// count): selecting it returns to the Info screen instead of loading an image
+// -- mirrors the ZuluIDE browse screen's "Back to Main Screen" sentinel (which
+// goes to Main), but SCSI browse is entered from Info, so it goes back there.
+// So the navigable range is [0, total], where `total` is this entry. Drawn as
+// two centered lines (see draw()); kBackToInfoLabel is the combined form
+// updateScroll() uses only to detect the entry changing.
+constexpr const char *kBackToInfoLabel = "Back to Info Screen";
+constexpr const char *kBackToInfoLine1 = "Back to";
+constexpr const char *kBackToInfoLine2 = "Info Screen";
 
 uint32_t millis() { return to_ms_since_boot(get_absolute_time()); }
 }  // namespace
@@ -122,7 +143,12 @@ void BrowseScreen::init(int index)
 
     const DeviceInfo *dev = _data->GetDevice(index);
     _scsiId = dev ? dev->id : 0;
-    _cursor = 0;
+    // Keep the browsed position across a menu round-trip (scroll change /
+    // close); otherwise start at the first image.
+    if (_preserveCursor)
+        _preserveCursor = false;
+    else
+        _cursor = 0;
     _ready = false;
 
     _lastScrollName[0] = '\0';
@@ -143,14 +169,23 @@ void BrowseScreen::tick()
         int total = _data->IndexedFilenameCount(_scsiId);
         if (total > 0)
         {
-            if (_cursor >= total) _cursor = total - 1;
+            // Cursor ranges over [0, total]; index == total is the virtual
+            // "Back to Info Screen" entry at the ring's wrap point.
+            if (_cursor > total) _cursor = total;
             if (_cursor < 0) _cursor = 0;
 
-            // Heap-allocated (not a stack local) -- sized to the full
-            // MAX_FILE_PATH, same convention as draw()/shortRotaryPress().
-            auto filenameBuf = std::make_unique<char[]>(MAX_FILE_PATH);
-            if (_data->GetIndexedFilename(_scsiId, _cursor, nullptr, 0, filenameBuf.get(), MAX_FILE_PATH))
-                updateScroll(filenameBuf.get());
+            if (_cursor == total)
+            {
+                updateScroll(kBackToInfoLabel);
+            }
+            else
+            {
+                // Heap-allocated (not a stack local) -- sized to the full
+                // MAX_FILE_PATH, same convention as draw()/shortRotaryPress().
+                auto filenameBuf = std::make_unique<char[]>(MAX_FILE_PATH);
+                if (_data->GetIndexedFilename(_scsiId, _cursor, nullptr, 0, filenameBuf.get(), MAX_FILE_PATH))
+                    updateScroll(filenameBuf.get());
+            }
         }
     }
 
@@ -161,6 +196,16 @@ void BrowseScreen::tick()
 void BrowseScreen::draw()
 {
     _fb->drawText(0, 0, "Browse");
+
+    // Show the active scroll multiplier (just right of the title) when it's
+    // above 1, so a >1 step is visible -- the big SCSI ID owns the far right.
+    int step = GetScrollStep();
+    if (step > 1)
+    {
+        char stepText[12];
+        snprintf(stepText, sizeof(stepText), "x%d", step);
+        _fb->drawText(Framebuffer128x64::textWidth("Browse") + 4, 0, stepText);
+    }
 
     // Header: large (2x) SCSI ID right-aligned, device-type icon
     // immediately to its left, divider line ending just short of the
@@ -181,11 +226,12 @@ void BrowseScreen::draw()
     if (lineEnd < 0) lineEnd = 0;
     _fb->drawHLine(0, 10, lineEnd);
 
+    // No popup drawn here -- display_task.cpp's global loading overlay
+    // covers any screen while a filenames fetch is in flight (see
+    // IsFilenamesFetchActive()), since the server can also push a filenames
+    // update unprompted with no screen having called RequestFilenames().
     if (!_ready)
-    {
-        printCenteredText("Loading...", 28);
         return;
-    }
 
     int total = _data->IndexedFilenameCount(_scsiId);
     if (total == 0)
@@ -194,8 +240,16 @@ void BrowseScreen::draw()
         return;
     }
 
-    // _cursor is already clamped to [0, total) by tick(), which runs
+    // _cursor is already clamped to [0, total] by tick(), which runs
     // before every draw() (see Screen::tick()).
+    if (_cursor == total)
+    {
+        // Virtual "Back to Info Screen" entry -- two centered lines, no folder
+        // line or "n of total" counter.
+        printCenteredText(kBackToInfoLine1, 20);
+        printCenteredText(kBackToInfoLine2, 32);
+        return;
+    }
 
     // Looked up directly from the index built once in tick() -- no
     // re-scan of the array to get from one filename to the next.
@@ -245,22 +299,46 @@ void BrowseScreen::rotaryChange(int direction)
     int total = _data->IndexedFilenameCount(_scsiId);
     if (total <= 0)
         return;
-    _cursor = (_cursor + direction + total) % total;
+
+    // Ring covers [0, total]: the extra slot (index == total) is the virtual
+    // "Back to Info Screen" entry. A large scroll step (10/50) must not jump
+    // over that slot when it wraps, so any move that would cross the end
+    // (forward) or the start (backward) from a real image lands ON the sentinel
+    // instead. From the sentinel itself, a step moves normally into the list
+    // (so it isn't a trap you can't leave with a big step). Copied from the
+    // ZuluIDE browse screen's rotaryChange().
+    int navCount = total + 1;
+    int step = GetScrollStep();
+
+    if (direction > 0)
+    {
+        if (_cursor != total && _cursor + step >= total)
+            _cursor = total;  // crossing the end -> stop on the sentinel
+        else
+            _cursor = (_cursor + step) % navCount;
+    }
+    else if (direction < 0)
+    {
+        if (_cursor != total && _cursor - step < 0)
+            _cursor = total;  // crossing the start -> stop on the sentinel
+        else
+            _cursor = ((_cursor - step) % navCount + navCount) % navCount;
+    }
     forceDraw();
 }
 
-void BrowseScreen::shortUserPress()
+void BrowseScreen::loadSelected()
 {
-    ChangeScreen(DisplayScreenType::Main, -1);
-}
+    // The virtual wrap-point entry (cursor == image count) isn't an image --
+    // selecting it returns to the Info screen. Reached from both the rotary
+    // push and the menu's "Select".
+    int total = _data->IndexedFilenameCount(_scsiId);
+    if (total > 0 && _cursor == total)
+    {
+        ChangeScreen(DisplayScreenType::Info, getOriginalIndex());
+        return;
+    }
 
-void BrowseScreen::shortEjectPress()
-{
-    shortRotaryPress();
-}
-
-void BrowseScreen::shortRotaryPress()
-{
     // Only the path is needed for LOAD_IMAGE -- looked up directly from
     // the index, same as draw().
     auto pathBuf = std::make_unique<char[]>(MAX_FILE_PATH);
@@ -282,9 +360,80 @@ void BrowseScreen::shortRotaryPress()
         zuluide::i2c::client::EnqueueRequest(I2C_CLIENT_LOAD_IMAGE, pathBuf.get());
     }
 
-    // Matches control.cpp's loadImageDeferred() exactly: "-- Info --" /
-    // "Loading" / "Image..." -- no filename (control.cpp:383).
-    ShowMessage("-- Info --", "Loading", "Image...", DisplayScreenType::Main, getOriginalIndex(), 1200);
+    // Task: selecting an image loads it and returns to the Info screen. The
+    // loading MessageBox auto-closes onto Info (control.cpp's loadImageDeferred()
+    // text: "-- Info --" / "Loading" / "Image...").
+    ShowMessage("-- Info --", "Loading", "Image...", DisplayScreenType::Info, getOriginalIndex(), 1200);
+}
+
+void BrowseScreen::buildMenu()
+{
+    // Like the ZuluIDE browse menu (Select / Close / Scroll N), but with a
+    // "Map" entry -- go to the SCSI Map -- added right after "Close" (task
+    // spec). A scroll step larger than the number of images is pointless, so
+    // hide any Scroll N whose N exceeds the item count (Scroll 1 is always
+    // offered), same rule the ZuluIDE browse menu uses.
+    int total = _data->IndexedFilenameCount(_scsiId);
+    int n = 0;
+
+    _menuItems[n] = "Select";    _menuActions[n] = kActSelect;  n++;
+    _menuItems[n] = "Close";     _menuActions[n] = kActClose;   n++;
+    _menuItems[n] = "Map";       _menuActions[n] = kActMap;     n++;
+    _menuItems[n] = "Info";      _menuActions[n] = kActInfo;    n++;
+    _menuItems[n] = "Scroll 1";  _menuActions[n] = kActScroll1; n++;
+    if (total >= 10) { _menuItems[n] = "Scroll 10"; _menuActions[n] = kActScroll10; n++; }
+    if (total >= 50) { _menuItems[n] = "Scroll 50"; _menuActions[n] = kActScroll50; n++; }
+
+    _menuCount = n;
+}
+
+void BrowseScreen::onMenuAction(void *ctx, int, int selected)
+{
+    auto *self = static_cast<BrowseScreen *>(ctx);
+    int action = (selected >= 0 && selected < self->_menuCount) ? self->_menuActions[selected] : kActClose;
+
+    switch (action)
+    {
+        // Select, Map and Info navigate away; the scroll/close actions return
+        // to Browse -- keep the current image (don't reset to the top).
+        case kActSelect:   self->loadSelected(); return;
+        case kActMap:      ChangeScreen(DisplayScreenType::Main, self->getOriginalIndex()); return;
+        case kActInfo:     ChangeScreen(DisplayScreenType::Info, self->getOriginalIndex()); return;
+        case kActScroll1:  SetScrollStep(1);  self->_preserveCursor = true; return;
+        case kActScroll10: SetScrollStep(10); self->_preserveCursor = true; return;
+        case kActScroll50: SetScrollStep(50); self->_preserveCursor = true; return;
+        case kActClose:
+        default:           self->_preserveCursor = true; return;
+    }
+}
+
+void BrowseScreen::shortUserPress()
+{
+    buildMenu();
+    ShowMenu(kMenuBrowse, "Browse Menu", _menuItems, _menuCount, kMenuScale,
+             DisplayScreenType::Browse, getOriginalIndex(), &BrowseScreen::onMenuAction, this);
+}
+
+void BrowseScreen::shortEjectPress()
+{
+    // Task: if a >1 scroll step is active, the eject button first resets the
+    // step to 1 (and shows a brief notice, staying on Browse) rather than
+    // leaving; otherwise it returns to the Info screen.
+    if (GetScrollStep() > 1)
+    {
+        SetScrollStep(1);
+        _preserveCursor = true;  // returns to Browse -- keep the current image
+        ShowMessage("-- Info --", "Scroll reset", "to 1", DisplayScreenType::Browse, getOriginalIndex(), 1000);
+        return;
+    }
+
+    ChangeScreen(DisplayScreenType::Info, getOriginalIndex());
+}
+
+void BrowseScreen::shortRotaryPress()
+{
+    // Task: the rotary button selects the image and goes to the Info screen.
+    loadSelected();
 }
 
 }  // namespace zuluide::display

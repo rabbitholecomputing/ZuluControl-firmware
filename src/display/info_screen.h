@@ -43,8 +43,8 @@
 //
 // Hidden placeholders (not drawn -- no data source for these yet):
 // IsRom/IsRaw overlay icons, BinCue-vs-File label switch, the "Style"
-// (BrowseMethod) line, and paging to InfoPage2/3/4 (rotaryChange is a
-// no-op here, unlike the original).
+// (BrowseMethod) line, and paging to InfoPage2/3/4 (the original paged these
+// with the rotary dial; here the dial drives the bottom action bar instead).
 
 #pragma once
 
@@ -65,7 +65,18 @@ public:
     void tick() override;
     void draw() override;
 
+    // Task-specified button mapping:
+    //  - rotary dial    -> move the ▶ marker along the bottom action bar
+    //                      (Browse / Eject-or-Insert / Map), wrapping both ways
+    //  - rotary push    -> activate the marked action (defaults to Browse)
+    //  - user button    -> open the main menu (Browse / SCSI Map / Close /
+    //                      Screensaver / Settings), formatted like the ZuluIDE
+    //                      main menu
+    //  - eject button   -> eject the drive directly
     void shortUserPress() override;
+    void shortRotaryPress() override;
+    void shortEjectPress() override;
+    void rotaryChange(int direction) override;
 
 private:
     DisplayData *_data;
@@ -74,6 +85,30 @@ private:
     bool _ready = false;
     bool _folderFound = false;
     char _folderText[MAX_FILE_PATH] = "";
+
+    // Bottom action-bar selection: 0 = Browse, 1 = Eject/Insert, 2 = Map. The
+    // middle entry shows "Insert" when the drive is ejected and "Eject" when a
+    // medium is loaded (task spec). Defaults to Browse (index 0) on every init.
+    enum { kBarBrowse = 0, kBarEjectInsert = 1, kBarMap = 2, kBarCount = 3 };
+    int _barSel = kBarBrowse;
+
+    void drawActionBar();
+    void activateBar();
+    void ejectDrive();
+    void insertDrive();
+
+    // Eject/(Insert)/Cancel confirmation menu the eject button raises -- same
+    // options as the SCSI Map's. "Insert" is only present while ejected, so the
+    // per-row action is recorded rather than assumed by position.
+    static constexpr int kMaxEjectItems = 3;
+    const char *_ejItems[kMaxEjectItems] = {nullptr};
+    int _ejActions[kMaxEjectItems] = {0};
+    int _ejCount = 0;
+    void buildEjectMenu();
+
+    // MenuScreen activation callback (ctx == this) for both the user-button
+    // menu and the eject-confirmation menu (distinguished by menuId).
+    static void onMenuAction(void *ctx, int menuId, int selected);
 
     // Ping-pong marquee state, timed to match scrolling_text.cpp/Screen.cpp
     // exactly (see header comment above).

@@ -33,7 +33,7 @@ constexpr int kRow0Y = 16;
 constexpr int kRowStep = 12;
 constexpr int kTextX = 12;
 
-enum { kRowScroll = 0, kRowSaver = 1 };
+enum { kRowScroll = 0, kRowSaver = 1, kRowWiFi = 2 };
 
 // Menu tags passed to ShowMenu(), distinguished in onMenuAction().
 enum { kMenuScroll = 0, kMenuSaver = 1 };
@@ -77,24 +77,25 @@ void IDESettingsScreen::draw()
         _fb->drawBitmap(2, kRow0Y + kRowStep, icon_select, 8, 8);
     _fb->drawText(kTextX, kRow0Y + kRowStep, line);
 
+    if (_selected == kRowWiFi)
+        _fb->drawBitmap(2, kRow0Y + kRowStep * 2, icon_select, 8, 8);
+    _fb->drawText(kTextX, kRow0Y + kRowStep * 2, "WiFi");
+
     _fb->drawText(0, 52, "push:edit  usr:back");
 }
 
 void IDESettingsScreen::openScrollMenu()
 {
-    // Same "hide steps larger than the image count" rule as the Browse menu.
-    int total = _data->IndexedFilenameCount(0);
+    // Task: the Settings scroll menu always offers all three steps (1, 10, 50),
+    // regardless of the current image count.
     static const int kSteps[] = {1, 10, 50};
     static const char *const kStepLabels[] = {"1", "10", "50"};
     int n = 0;
     for (int i = 0; i < 3; i++)
     {
-        if (kSteps[i] == 1 || total >= kSteps[i])
-        {
-            _menuItems[n] = kStepLabels[i];
-            _menuValues[n] = kSteps[i];
-            n++;
-        }
+        _menuItems[n] = kStepLabels[i];
+        _menuValues[n] = kSteps[i];
+        n++;
     }
     _menuCount = n;
     ShowMenu(kMenuScroll, "Scroll", _menuItems, _menuCount, kMenuScale,
@@ -133,11 +134,14 @@ void IDESettingsScreen::onMenuAction(void *ctx, int menuId, int selected)
 
 void IDESettingsScreen::shortRotaryPress()
 {
-    // Open the menu listing every choice for the highlighted row.
+    // Open the menu listing every choice for the highlighted row, or -- for the
+    // WiFi row -- switch to the read-only WiFi status page.
     if (_selected == kRowScroll)
         openScrollMenu();
-    else
+    else if (_selected == kRowSaver)
         openSaverMenu();
+    else if (_selected == kRowWiFi)
+        ChangeScreen(DisplayScreenType::WiFi, getOriginalIndex());
 }
 
 void IDESettingsScreen::rotaryChange(int direction)

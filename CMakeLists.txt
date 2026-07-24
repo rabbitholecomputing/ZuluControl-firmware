@@ -54,6 +54,7 @@ target_sources(zulucontrol PRIVATE
     src/display/ide_main_screen.cpp
     src/display/ide_browse_screen.cpp
     src/display/ide_settings_screen.cpp
+    src/display/wifi_screen.cpp
     src/display/about_screen.cpp
     src/display/firmware_upgrade_screen.cpp
     src/display/screen_saver.cpp

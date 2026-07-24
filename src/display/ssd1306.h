@@ -42,6 +42,15 @@ public:
     // other bus traffic, same as the original control.cpp's initScreenHardware()).
     bool Init(i2c_inst_t *i2c, unsigned int sdaPin, unsigned int sclPin, unsigned int baudrate, uint8_t addr);
 
+    // Re-runs the panel's power-on command sequence (charge pump, addressing
+    // window, contrast, display-on) without re-touching the already-initialized
+    // I2C1 master/DMA -- a recovery path for a panel left mis-configured by a
+    // glitch on the shared bus. Aborts any in-flight async push first, then
+    // runs blocking like Init(). The caller must force a full framebuffer
+    // re-push afterwards, since Reset() only reconfigures the controller and
+    // does not touch GDDRAM.
+    bool Reset();
+
     // Starts an async push of the framebuffer, one page (128 bytes) at a
     // time rather than all 1024 bytes in a single DMA burst -- see Poll()
     // for why. Returns false if a previous push is still in flight (call
@@ -78,6 +87,7 @@ private:
 
     bool startNextChunk();
     bool sendCommandsBlocking(const uint8_t *cmds, size_t n);
+    bool sendInitSequence();
 };
 
 }  // namespace zuluide::display

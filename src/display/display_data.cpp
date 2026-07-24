@@ -175,6 +175,14 @@ void DisplayData::parseStatus()
         }
 
         dev.ejected = (dev.image[0] == '\0');
+
+        // "isDeferred" is serialized as a quoted string ("true"/"false") by the
+        // device -- system_status.cpp's outputField(bool) writes toString(bool),
+        // not a JSON boolean -- so json::FindBool (which only matches an unquoted
+        // true/false) can't read it; pull it out as a string and compare.
+        char deferredStr[8] = "";
+        json::FindString(json, len, "isDeferred", deferredStr, sizeof(deferredStr));
+        dev.deferred = (strcmp(deferredStr, "true") == 0);
     }
 }
 

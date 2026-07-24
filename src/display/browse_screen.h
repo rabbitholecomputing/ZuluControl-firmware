@@ -36,11 +36,21 @@
 // next/previous filename never re-parses the array. That source carries only paths, no
 // size/isDir, so this screen doesn't show a size line. Header matches
 // BrowseScreenFlat.cpp:184-200: large (2x) SCSI ID right-aligned with the
-// device-type icon immediately to its left. Button mapping: rotary =
-// next/prev, both eject-press and rotary-press load the selected image,
-// user-press = back to Main. Filename line is a scrolling marquee (see
-// updateScroll()), identical timing to InfoScreen's -- not ellipsized like
-// Screen's other default text.
+// device-type icon immediately to its left. Filename line is a scrolling
+// marquee (see updateScroll()), identical timing to InfoScreen's -- not
+// ellipsized like Screen's other default text.
+//
+// Task-specified button mapping:
+//  - rotary dial            -> move the cursor by the current scroll step
+//                              (ui_settings.h's GetScrollStep(): 1/10/50)
+//  - rotary button (push)   -> load the selected image, then go to Info
+//  - eject button           -> back to the Info screen
+//  - user button (Insert)   -> open the browse popup menu -- like the ZuluIDE
+//                              browse menu, but with a "Map" entry (go to the
+//                              SCSI Map) added after "Close": Select / Close /
+//                              Map / Scroll 1 / Scroll 10 / Scroll 50
+// While the popup is open, the rotary dial moves the selection, the rotary
+// push activates it, and the eject button closes the popup.
 
 #pragma once
 
@@ -72,6 +82,28 @@ private:
     int _scsiId = 0;
     int _cursor = 0;
     bool _ready = false;
+
+    // Set on transitions that bounce straight back into this screen (closing
+    // the menu, changing the scroll step), so init() keeps the currently-
+    // browsed image instead of jumping back to the first. A fresh entry from
+    // another screen leaves it false and starts at the top. One-shot: consumed
+    // (cleared) by init().
+    bool _preserveCursor = false;
+
+    // The browse menu is built per-open (the offered Scroll N options depend on
+    // how many images the list holds), so the label pointers and their actions
+    // need storage that outlives the MenuScreen (which only borrows the label
+    // array). Select + Close + Map + Info + up to three scroll steps = 7 max.
+    static constexpr int kMaxMenuItems = 7;
+    const char *_menuItems[kMaxMenuItems] = {nullptr};
+    int _menuActions[kMaxMenuItems] = {0};
+    int _menuCount = 0;
+
+    void buildMenu();
+    void loadSelected();
+
+    // MenuScreen activation callback (ctx == this).
+    static void onMenuAction(void *ctx, int menuId, int selected);
 
     // Ping-pong marquee state for the filename line, timed identically to
     // InfoScreen's scroller (see info_screen.cpp's updateScroll()): 3px

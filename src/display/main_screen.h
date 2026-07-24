@@ -19,21 +19,21 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  **/
 
-// Full port of ZuluSCSI-firmware's "SCSI Map" (lib/ZuluSCSI_UI_RP2MCU/
-// MainScreen.h/.cpp): all MAX_DEVICES (16) SCSI-ID slots are drawn (8 per
-// page, 4 per column, MainScreen.cpp:32-33,109-120), not just the ones a
-// device is actually present at -- DisplayData::GetDevice() always
-// returns a valid slot; `.present` (this iteration's DeviceMap::Active
-// stand-in) decides whether the type icon/LED are drawn for it, same as
-// the original's `if (map->Active)` branch. Selection/rotaryChange only
-// ever lands on present slots, exactly like the original's Active-only
-// search loops.
-//
-// Unlike the original (always 2 fixed pages for 16 targets), the page
-// count here is derived from the highest present device's slot -- e.g.
-// "(1/1)" rather than a fixed "(1/2)" when nothing is present above SCSI
-// ID 7, since our data comes from a JSON device list rather than a live
-// SD-card scan of all 16 IDs.
+// Port of ZuluSCSI-firmware's "SCSI Map" (lib/ZuluSCSI_UI_RP2MCU/
+// MainScreen.h/.cpp), with one deliberate deviation: the original draws
+// all MAX_DEVICES (16) SCSI-ID slots at their raw ID's fixed grid position
+// (8 per page, 4 per column, MainScreen.cpp:32-33,109-120), showing an
+// empty/off-LED entry for every unpopulated ID -- so gaps between present
+// IDs show up as blank slots. Here, draw() instead compacts every present
+// device (`.present`, this iteration's DeviceMap::Active stand-in) into
+// consecutive grid slots in reading order -- upper-left down to
+// lower-left, then upper-right down to lower-right -- continuing onto
+// further DEVICES_PER_PAGE-sized pages as needed, so no slot is ever left
+// blank between two present devices. Selection/rotaryChange still track
+// the device's real SCSI-ID index (only ever landing on present slots,
+// exactly like the original's Active-only search loops); draw() derives
+// each page's slate and the current page number from the selected
+// device's *rank* among present devices, not its raw ID.
 //
 // The status JSON can arrive after this screen is already showing (e.g.
 // right at boot, before the first I2C round trip completes), which would
@@ -74,6 +74,7 @@ public:
     void tick() override;
 
     void shortRotaryPress() override;
+    void shortUserPress() override;
     void shortEjectPress() override;
     void longUserPress() override;
     void longEjectPress() override;
@@ -86,6 +87,29 @@ private:
     int _selectedIndex = -1;
 
     void drawDeviceItem(int x, int y, int deviceIndex);
+
+    // Ejects the currently-selected device's image (I2C_CLIENT_EJECT_IMAGE)
+    // and pops a brief confirmation MessageBox. Shared by longEjectPress()
+    // and the Eject-confirmation menu's "Eject" item.
+    void ejectSelected();
+
+    // Inserts media into the currently-selected device (I2C_CLIENT_INSERT_MEDIA),
+    // reached from the eject menu's "Insert" item (offered only while ejected).
+    void insertSelected();
+
+    // Builds the Eject/(Insert)/Cancel confirmation menu into _ejItems/
+    // _ejActions -- "Insert" is only present when the device is ejected, so the
+    // per-row action is recorded rather than assumed by position.
+    static constexpr int kMaxEjectItems = 3;
+    const char *_ejItems[kMaxEjectItems] = {nullptr};
+    int _ejActions[kMaxEjectItems] = {0};
+    int _ejCount = 0;
+    void buildEjectMenu();
+
+    // MenuScreen activation callback (ctx == this) for the ZuluIDE-style
+    // Eject confirmation the eject button now raises. Static so it can be
+    // passed as a plain function pointer to ShowMenu.
+    static void onMenuAction(void *ctx, int menuId, int selected);
 
     // Selects the first present device if nothing is selected yet -- called
     // from both init() and tick(), since the status JSON may not have

@@ -71,13 +71,8 @@ bool Ssd1306Display::sendCommandsBlocking(const uint8_t *cmds, size_t n)
     return ok;
 }
 
-bool Ssd1306Display::Init(i2c_inst_t *i2c, unsigned int sdaPin, unsigned int sclPin, unsigned int baudrate, uint8_t addr)
+bool Ssd1306Display::sendInitSequence()
 {
-    _addr = addr;
-
-    if (!I2CMasterDmaInit(i2c, sdaPin, sclPin, baudrate))
-        return false;
-
     // Sequence and values ported from Adafruit_SSD1306::begin(), specialized
     // for this board's fixed configuration: 128x64, SSD1306_SWITCHCAPVCC
     // (internal charge pump), each array sent as its own I2C transaction
@@ -95,9 +90,10 @@ bool Ssd1306Display::Init(i2c_inst_t *i2c, unsigned int sdaPin, unsigned int scl
     const uint8_t init3[] = {SSD1306_MEMORYMODE, 0x00, (uint8_t)(SSD1306_SEGREMAP | 0x1), SSD1306_COMSCANDEC};
     if (!sendCommandsBlocking(init3, sizeof(init3))) return false;
 
-    // 128x64 internal-VCC values (Adafruit_SSD1306.cpp:596-598)
+    // 128x64 internal-VCC values (Adafruit_SSD1306.cpp:596-598). _contrast is
+    // whatever it currently is (0xCF default, or a value SetContrast() set) so
+    // a Reset() preserves the live contrast rather than snapping back to full.
     const uint8_t comPins = 0x12;
-    _contrast = 0xCF;
 
     const uint8_t compinsCmd[] = {SSD1306_SETCOMPINS, comPins};
     if (!sendCommandsBlocking(compinsCmd, sizeof(compinsCmd))) return false;
@@ -119,6 +115,28 @@ bool Ssd1306Display::Init(i2c_inst_t *i2c, unsigned int sdaPin, unsigned int scl
     if (!sendCommandsBlocking(colAddr, sizeof(colAddr))) return false;
 
     return true;
+}
+
+bool Ssd1306Display::Init(i2c_inst_t *i2c, unsigned int sdaPin, unsigned int sclPin, unsigned int baudrate, uint8_t addr)
+{
+    _addr = addr;
+    _contrast = 0xCF;  // 128x64 internal-VCC default
+
+    if (!I2CMasterDmaInit(i2c, sdaPin, sclPin, baudrate))
+        return false;
+
+    return sendInitSequence();
+}
+
+bool Ssd1306Display::Reset()
+{
+    // Abort any async page-push left in flight -- sendInitSequence()
+    // reconfigures the addressing window, so a page still streaming from the
+    // old frame must not land in the middle of the reconfigure.
+    _pushFb = nullptr;
+    _pushOffset = 0;
+
+    return sendInitSequence();
 }
 
 bool Ssd1306Display::startNextChunk()

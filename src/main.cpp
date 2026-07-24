@@ -45,6 +45,8 @@
 #include "lwip/init.h"
 #include "lwip/netif.h"
 #include "lwip/dhcp.h"
+#include "lwip/tcp.h"
+#include "lwip/priv/tcp_priv.h"  // tcp_listen_pcbs / tcp_active_pcbs -- for restarting httpd
 #include "pico/cyw43_arch.h"
 #include "url_decode.h"
 #include "ZuluControl_config.h"
@@ -88,6 +90,11 @@ static bool  g_filenames_overflow = false;
 static uint8_t g_filenames_active_id = 0xFF;
 // SCSI ID whose pointer to serve for the next /filenames.json response.
 static uint8_t g_filenames_serving_id = 0xFF;
+// Raw payload bytes received for the fetch currently (or most recently) in
+// progress -- reset each time ProcessUpdateFilenames() starts a new fetch,
+// accumulated in ProcessFilename() -- lets the display show fetch progress
+// (see GetFilenamesBytesReceived()).
+static size_t g_filenames_bytes_received = 0;
 
 static volatile FilenameCacheState filenameState = FilenameCacheState::Idle;
 
@@ -117,11 +124,16 @@ char ipBuffer[32] = {0};
 
 static char versionJson[MAX_MSG_SIZE];
 static char currentStatus[MAX_MSG_SIZE];
+// True from the first ProcessSystemStatus() call onward -- distinguishes
+// "no status received yet" from "server pushed an empty/degenerate status",
+// which an empty currentStatus[] can't (see HasReceivedStatus()).
+static bool g_status_received = false;
 
 // ── Accessors for src/display's read-only view of the cached JSON above (see webui_data.h) ──
 
 const char *GetCurrentStatusJson() { return currentStatus; }
 bool GetSdPresent() { return g_sd_present; }
+bool HasReceivedStatus() { return g_status_received; }
 const char *GetVersionJson() { return versionJson; }
 const char *GetDeviceListJson() { return deviceListJson; }
 
@@ -130,6 +142,13 @@ const char *GetFilenamesJson(int scsiId)
     if (scsiId < 0 || scsiId >= (int)MAX_SCSI_IDS)
         return "";
     return g_filenames_scsi_id[scsiId] ? g_filenames_scsi_id[scsiId] : "";
+}
+
+size_t GetFilenamesBytesReceived() { return g_filenames_bytes_received; }
+
+bool IsFilenamesFetchActive()
+{
+    return filenameState == FilenameCacheState::Start || filenameState == FilenameCacheState::Fetching;
 }
 
 bool RequestFilenames(int scsiId)
@@ -177,6 +196,14 @@ static std::string wifiPass;
 static bool wifiPassSet = false;
 static std::string wifiSSID;
 static std::string serverAPIVersion;
+// Just the version portion of serverAPIVersion (up to the first space,
+// e.g. "4.0.0" out of "4.0.0 ZuluSCSI") -- what the splash screen's
+// mismatch banner shows, since the device name is shown separately there.
+static std::string serverAPIVersionOnly;
+// True once ProcessServerAPIVersion() has run and the server's major
+// version didn't match ours (or the server sent no version at all) -- see
+// that function's matching_major_version for the comparison itself.
+static bool g_api_version_mismatch = false;
 
 // ── State machine ─────────────────────────────────────────────────────────────
 
@@ -215,6 +242,105 @@ static void reset() {
     memset(&static_ip, 0, sizeof(static_ip));
     memset(&static_netmask, 0, sizeof(static_netmask));
     memset(&static_gw, 0, sizeof(static_gw));
+}
+
+// ── WiFi status snapshot for the display (see webui_data.h) ────────────────────
+// Global-scope (matches webui_data.h's declaration and the other Get*() accessors
+// above), reading the same local RM2 state the WiFi state machine maintains.
+
+// Formats a raw lwIP IPv4 address (host byte order per ip4_addr_t::addr, i.e.
+// octets little-end first, matching the WIFIDown-state IP print) into dotted
+// decimal.
+static void FormatIp4(uint32_t addr, char *buf, size_t bufSize)
+{
+    snprintf(buf, bufSize, "%lu.%lu.%lu.%lu",
+             (unsigned long)(addr & 0xFF), (unsigned long)((addr >> 8) & 0xFF),
+             (unsigned long)((addr >> 16) & 0xFF), (unsigned long)(addr >> 24));
+}
+
+// Maps a cyw43 tcpip link-status code to a short human-readable phrase for the
+// WiFi screen's connecting / connection-error lines.
+static const char *WiFiLinkStatusMessage(int link_status)
+{
+    switch (link_status) {
+        case CYW43_LINK_DOWN:    return "Link down";
+        case CYW43_LINK_JOIN:    return "Joining network";
+        case CYW43_LINK_NOIP:    return "Waiting for IP";
+        case CYW43_LINK_UP:      return "Connected";
+        case CYW43_LINK_FAIL:    return "Connection failed";
+        case CYW43_LINK_NONET:   return "Network not found";
+        case CYW43_LINK_BADAUTH: return "Wrong password";
+        default:                 return "Connecting";
+    }
+}
+
+void GetWiFiStatus(WiFiStatusInfo *out)
+{
+    if (out == nullptr)
+        return;
+
+    *out = WiFiStatusInfo{};
+
+    extern cyw43_t cyw43_state;
+
+    // The MAC belongs to the radio itself, so it's available (and worth showing
+    // on the error screen) even when there is no association.
+    uint8_t mac[6] = {0};
+    if (cyw43_wifi_get_mac(&cyw43_state, CYW43_ITF_STA, mac) == 0) {
+        snprintf(out->mac, sizeof(out->mac), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    }
+
+    // No SSID configured at all -- the host sent none and none was compiled in.
+    if (wifiSSID.empty()) {
+        out->state = WiFiStatusInfo::State::NoSSID;
+        return;
+    }
+
+    strncpy(out->ssid, wifiSSID.c_str(), sizeof(out->ssid) - 1);
+
+    int link_status = cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA);
+
+    // A link that's up (has an IP) is "connected" for display purposes -- show
+    // the signal strength / IP straight away, rather than gating on the state
+    // machine also reaching State::Normal (which lagged the link coming up by a
+    // few iterations and left the screen briefly reading "Connecting...").
+    if (link_status == CYW43_LINK_UP) {
+        out->state = WiFiStatusInfo::State::Connected;
+
+        // Read IP / netmask / gateway straight off the STA netif (authoritative
+        // for both DHCP and static-IP configs, and the only source for the
+        // netmask/gateway the details page shows).
+        struct netif *nif = &cyw43_state.netif[CYW43_ITF_STA];
+        FormatIp4(nif->ip_addr.addr, out->ip, sizeof(out->ip));
+        FormatIp4(nif->netmask.addr, out->netmask, sizeof(out->netmask));
+        FormatIp4(nif->gw.addr, out->gateway, sizeof(out->gateway));
+
+        int32_t rssi = 0;
+        if (cyw43_wifi_get_rssi(&cyw43_state, &rssi) == 0)
+            out->rssi = rssi;
+    } else if (link_status < 0) {
+        // Negative codes are hard association failures (fail / no-net / bad-auth).
+        out->state = WiFiStatusInfo::State::Error;
+        out->error = WiFiLinkStatusMessage(link_status);
+    } else {
+        // Non-negative but not up yet: the link is still coming up.
+        out->state = WiFiStatusInfo::State::Connecting;
+        out->error = WiFiLinkStatusMessage(link_status);
+    }
+}
+
+void RequestWiFiReconnect()
+{
+    // Stop the current connection first, then start a fresh one: disassociate
+    // from the network, then re-enter WIFIInit (which re-runs sta setup + DHCP
+    // and reconnects -- the same restart the host's I2C_SERVER_WIFI_CONNECT
+    // triggers via ProcessWiFiConnect()). programState is only ever mutated on
+    // core0's main loop, which is also where the display runs, so this is a
+    // plain assignment.
+    extern cyw43_t cyw43_state;
+    cyw43_wifi_leave(&cyw43_state, CYW43_ITF_STA);
+    programState = State::WIFIInit;
 }
 
 // ── I2C callback implementations ─────────────────────────────────────────────
@@ -284,6 +410,9 @@ void ProcessServerAPIVersion(const uint8_t *message, size_t length)
 
         // Parse device name from after the first space
         const char *space = (const char *)memchr(message, ' ', length);
+        serverAPIVersionOnly = (space != NULL)
+            ? std::string((const char*)message, (size_t)(space - (const char*)message))
+            : serverAPIVersion;
         if (space != NULL && (space + 1) < ((const char*)message + length)) {
             const char *parsed_name = space + 1;
             size_t name_len = length - (size_t)(parsed_name - (const char*)message);
@@ -305,7 +434,10 @@ void ProcessServerAPIVersion(const uint8_t *message, size_t length)
         strcat(versionJson, ", \"serverAPIVersion\":\"Unknown\"");
         printf("Error: no API version received from server\n");
         g_device_type = zulucontrol::config::DeviceType::ZuluIDE;
+        serverAPIVersionOnly.clear();
     }
+
+    g_api_version_mismatch = !matching_major_version;
 
     strcat(versionJson, ", \"deviceType\":\"");
     strcat(versionJson, device_name);
@@ -313,7 +445,7 @@ void ProcessServerAPIVersion(const uint8_t *message, size_t length)
 
     if (!matching_major_version) {
         strcat(versionJson, ", \"message\":\"API major version mismatch. Please update both devices to the latest firmware. "
-            "<br/> <a href='https://github.com/ZuluIDE/ZuluIDE-HTTP-PicoW/releases'>ZuluControl firmware</a>\"");
+            "<br/> <a href='https://github.com/rabbitholecomputing/ZuluControl-firmware/releases'>ZuluControl-firmware downloads</a>\"");
         printf("Warning: major versions between client and server do not match. Please upgrade both devices.\n");
     }
 
@@ -335,6 +467,7 @@ void ProcessSystemStatus(const uint8_t *message, size_t length)
 {
     memset(currentStatus, 0, MAX_MSG_SIZE);
     memcpy(currentStatus, message, length < MAX_MSG_SIZE ? length : MAX_MSG_SIZE - 1);
+    g_status_received = true;
 }
 
 void ProcessUpdateFilenames(const uint8_t *message, size_t length)
@@ -367,6 +500,7 @@ void ProcessUpdateFilenames(const uint8_t *message, size_t length)
            g_device_type == zulucontrol::config::DeviceType::ZuluSCSI ? "SCSI" : "IDE", incoming_id);
     g_filenames_active_id = incoming_id;
     g_filenames_id_start   = g_filenames_write_ptr;
+    g_filenames_bytes_received = 0;
     filenameState = FilenameCacheState::Start;
 }
 
@@ -393,6 +527,7 @@ void ProcessFilename(const uint8_t *message, size_t length)
 
     char *buf_end = filenames_json + FILENAMES_JSON_CACHE_SIZE;
     printf("Process filename length: %zu\n", data_len);
+    g_filenames_bytes_received += data_len;
 
     // Write the opening JSON header on the first call for this ID.
     if (filenameState == FilenameCacheState::Start) {
@@ -642,6 +777,9 @@ void ProcessUpgradeFirmwareData(const uint8_t* message, size_t length) {
 }
 
 }  // namespace zuluide::i2c::client
+
+bool IsApiVersionMismatch() { return g_api_version_mismatch; }
+const char *GetServerAPIVersionOnly() { return serverAPIVersionOnly.c_str(); }
 
 // ── CGI handlers ─────────────────────────────────────────────────────────────
 
@@ -904,6 +1042,79 @@ void httpd_post_finished(void *connection, char *response_uri, u16_t response_ur
     g_httpd_post_finished_handler     = nullptr;
 }
 
+// ── HTTP server (re)start ─────────────────────────────────────────────────────
+
+// lwIP's httpd exposes no teardown entry point, so to genuinely restart the
+// server after a WiFi reconnect we free every PCB still holding
+// HTTPD_SERVER_PORT and abort any HTTP connections left half-open by the drop,
+// then re-run httpd_init(). Walking the raw PCB lists is the accepted workaround
+// for httpd's missing stop function; the small altcp listen wrapper leaked by
+// tcp_close() is negligible next to the once-per-reconnect frequency here.
+//
+// SO_REUSE is off in lwipopts.h, so httpd_init()'s tcp_bind() rejects the port
+// (LWIP_ASSERT -> panic "httpd_init: tcp_bind failed") if *any* PCB on *any*
+// list still has it -- including a browser connection that closed cleanly and
+// is sitting in TIME_WAIT. So all four lists have to be cleared here, not just
+// the listener and active connections.
+//
+// All lwIP PCB access, including httpd_init()'s own tcp_new/tcp_bind, must
+// happen under the cyw43 lock -- so it's held across the whole restart.
+static void restart_http_server() {
+    cyw43_arch_lwip_begin();
+
+    // Close the listening socket(s) on the HTTP port.
+    struct tcp_pcb_listen *lpcb = tcp_listen_pcbs.listen_pcbs;
+    while (lpcb != NULL) {
+        struct tcp_pcb_listen *next = lpcb->next;
+        if (lpcb->local_port == HTTPD_SERVER_PORT) {
+            tcp_close((struct tcp_pcb *)lpcb);
+        }
+        lpcb = next;
+    }
+
+    // Abort HTTP connections stranded by the disconnect so they release their
+    // pool slots (httpd frees the associated http_state via its err callback)
+    // and, crucially, free the port before the re-bind below.
+    struct tcp_pcb *pcb = tcp_active_pcbs;
+    while (pcb != NULL) {
+        struct tcp_pcb *next = pcb->next;
+        if (pcb->local_port == HTTPD_SERVER_PORT) {
+            tcp_abort(pcb);
+        }
+        pcb = next;
+    }
+
+    // Drop any TIME_WAIT PCBs on the port -- these linger for 2*MSL after a
+    // normal close (e.g. the browser tab that was open when the link dropped)
+    // and, with SO_REUSE off, are enough on their own to fail the re-bind.
+    // tcp_abort() removes a TIME_WAIT PCB from tcp_tw_pcbs and frees it.
+    pcb = tcp_tw_pcbs;
+    while (pcb != NULL) {
+        struct tcp_pcb *next = pcb->next;
+        if (pcb->local_port == HTTPD_SERVER_PORT) {
+            tcp_abort(pcb);
+        }
+        pcb = next;
+    }
+
+    // And any PCB bound-but-not-yet-listening on the port, for completeness.
+    pcb = tcp_bound_pcbs;
+    while (pcb != NULL) {
+        struct tcp_pcb *next = pcb->next;
+        if (pcb->local_port == HTTPD_SERVER_PORT) {
+            tcp_close(pcb);
+        }
+        pcb = next;
+    }
+
+    httpd_init();
+    http_set_cgi_handlers(cgi_handlers, sizeof(cgi_handlers) / sizeof(cgi_handlers[0]));
+
+    cyw43_arch_lwip_end();
+
+    zuluide::i2c::client::LogMessageToServer(ClientMessage::Type::Debug, "Http server restarted after WiFi reconnect.");
+}
+
 // ── Core 1 (I2C slave) ────────────────────────────────────────────────────────
 
 void core1_main() {
@@ -1109,6 +1320,10 @@ int main() {
                             http_set_cgi_handlers(cgi_handlers, sizeof(cgi_handlers) / sizeof(cgi_handlers[0]));
                             LogMessageToServer(ClientMessage::Type::Debug, "Http server initialized.");
                             httpInitialized = true;
+                        } else {
+                            // WiFi reconnected: restart the web server so it drops
+                            // stale connections and re-listens on the fresh link.
+                            restart_http_server();
                         }
 
                         cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);

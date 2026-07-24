@@ -53,9 +53,9 @@ public:
 
 private:
     DisplayData *_data;
-    int _selected = 0;  // 0 = scroll step, 1 = screen saver
+    int _selected = 0;  // 0 = scroll step, 1 = screen saver, 2 = WiFi status
 
-    static constexpr int kRowCount = 2;
+    static constexpr int kRowCount = 3;
 
     // Storage for the menu's dynamically-built item list (MenuScreen only
     // borrows the label array). Saver lists all styles (Random + 6), scroll

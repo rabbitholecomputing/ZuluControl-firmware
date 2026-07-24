@@ -90,14 +90,38 @@ function autoRefresh() {
 
 // ── ZuluIDE ──────────────────────────────────────────────────────────────────
 
+// The loaded image's media type is reported both as status.image.type
+// (cdrom / zip100 / zip250 / zip750 / removable / harddrive) and, encoded in
+// the filename, as a ZuluIDE image prefix (zipd / z100 / z250 / z750, plus the
+// legacy long form "zipdrive"). Any of the Zip variants -- by either route --
+// is shown as "Zip Drive"; everything else keeps the historical "CD-ROM" label.
+function ideMediaTypeLabel(image) {
+  if (image) {
+    var type = (image.type || '').toLowerCase();
+    if (type.indexOf('zip') === 0) return 'Zip Drive';
+    var name = (image.filename || '').toLowerCase();
+    var base = name.substring(name.lastIndexOf('/') + 1);
+    if (/^(zipdrive|zipd|z100|z250|z750)/.test(base)) return 'Zip Drive';
+  }
+  return 'CD-ROM';
+}
+
 function ideUpdateStatus(status) {
   var sdElm = document.getElementById('ide-sd');
   sdElm.innerHTML = status.sdPresent ? 'Present' : 'Not present';
   sdElm.style.color = status.sdPresent ? '' : 'red';
   var elm = document.getElementById('ide-dt');
-  elm.innerHTML = (status.isPrimary ? 'Primary' : 'Secondary') + ' CD-ROM';
+  elm.innerHTML = (status.isPrimary ? 'Primary' : 'Secondary') + ' ' + ideMediaTypeLabel(status.image);
   elm = document.getElementById('ide-img');
-  elm.innerHTML = status.image ? status.image.filename : '(no image)';
+  var imgName = status.image ? status.image.filename : '(no image)';
+  // isDeferred is serialized as the string "true"/"false" (the device writes
+  // toString(bool), not a JSON boolean), so compare against the string rather
+  // than testing truthiness -- the string "false" is itself truthy.
+  if (status.isDeferred === 'true') {
+    elm.innerHTML = imgName + '<br/>[Host deferred ejection]';
+  } else {
+    elm.innerHTML = imgName;
+  }
 }
 
 function ideEjectClk() {

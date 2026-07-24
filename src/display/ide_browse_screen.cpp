@@ -191,11 +191,12 @@ void IDEBrowseScreen::draw()
 
     _fb->drawHLine(0, 10, Framebuffer128x64::WIDTH);
 
+    // No popup drawn here -- display_task.cpp's global loading overlay
+    // covers any screen while a filenames fetch is in flight (see
+    // IsFilenamesFetchActive()), since the server can also push a filenames
+    // update unprompted with no screen having called RequestFilenames().
     if (!_ready)
-    {
-        printCenteredText("Loading...", 28);
         return;
-    }
 
     int total = _data->IndexedFilenameCount(kIdeDeviceIndex);
     if (total == 0)

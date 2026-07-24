@@ -61,6 +61,10 @@ struct DeviceInfo
     // IDE device -- shown as "pri"/"sec" on the ZuluIDE main screen). Always
     // true / unused on ZuluSCSI.
     bool primary = true;
+    // ZuluIDE only: the status JSON's "isDeferred" flag -- a new image load is
+    // pending until the host ejects the currently-locked media. Surfaced as a
+    // "[Host deferred eject]" banner. Unused on ZuluSCSI.
+    bool deferred = false;
 };
 
 // One entry in the combined filename index (see DisplayData::MAX_FILENAME_INDEX):

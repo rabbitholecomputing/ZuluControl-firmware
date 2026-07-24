@@ -189,6 +189,12 @@ void IDEMainScreen::draw()
         _fb->clearClip();
     }
 
+    // A deferred load is waiting on the host to release/eject the current media;
+    // the currently-loaded image (above) stays shown while this banner explains
+    // why the newly-selected image hasn't taken effect yet.
+    if (dev && dev->present && dev->deferred)
+        printCenteredText("[Host deferred eject]", 32);
+
     // Hint line for the button mapping.
     _fb->drawText(0, 52, "push:browse  usr:menu");
 }

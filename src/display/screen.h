@@ -37,6 +37,16 @@
 
 namespace zuluide::display {
 
+// Bordered overlay box (same visual language as MessageBox, but wide enough
+// for a full-width message), drawn directly onto `fb` with `message` on the
+// first line and "<bytesTransferred>/<totalBytes>" (short "12B"/"4kB" form)
+// centered below it. A free function (not a Screen method) so
+// display_task.cpp's global loading overlay -- which needs to draw over
+// whatever screen is active, without being one itself -- can call it
+// directly on the shared framebuffer, in addition to Screen subclasses
+// calling it on their own _fb.
+void DrawLoadingPopup(Framebuffer128x64 *fb, const char *message, size_t bytesTransferred, size_t totalBytes);
+
 class Screen
 {
 public:

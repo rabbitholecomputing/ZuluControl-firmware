@@ -51,6 +51,10 @@ enum class DisplayScreenType
     // Shared, configurable scrollable-list menu screen (see menu_screen.h),
     // switched to via ShowMenu() the way MessageBox is via ShowMessage().
     Menu,
+    // Read-only WiFi status page (SSID / signal / IP / MAC, or a "no SSID"
+    // / connection-error variant), reached from the Settings screen's "WiFi"
+    // row. Backed by the control board's own RM2 radio state (see wifi_screen.h).
+    WiFi,
 };
 
 }  // namespace zuluide::display

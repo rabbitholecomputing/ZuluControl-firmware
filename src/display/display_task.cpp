@@ -24,6 +24,7 @@
 #include "ssd1306.h"
 #include "gpio_expander.h"
 #include "display_data.h"
+#include "screen.h"                   // DrawLoadingPopup
 #include "screen_saver.h"
 #include "screen_registry.h"
 #include "screen_type.h"
@@ -31,6 +32,7 @@
 #include "ui_settings.h"
 #include "../ZuluControlI2CClient.h"  // FW_VERSION
 #include "../fw_upgrade.h"            // FwUpgradeStatus / fwupgrade_get_status
+#include "../webui_data.h"            // IsFilenamesFetchActive / GetFilenamesBytesReceived
 #include <hardware/i2c.h>
 #include <hardware/sync.h>           // save_and_disable_interrupts (pump guard)
 #include <pico/time.h>
@@ -65,6 +67,15 @@ constexpr uint32_t kPushIntervalMs = 33;
 // the transfer noticeably. ~10Hz is smooth enough for a progress bar.
 constexpr uint32_t kFwPushIntervalMs = 100;
 
+// How long the completed "X/Y" filenames-loading popup stays visible after
+// the fetch actually finishes, before being dismissed -- long enough to
+// read the final byte count rather than having it vanish the instant the
+// closing sentinel arrives.
+constexpr uint32_t kLoadingHoldMs = 2000;
+
+// SD Card Inserted/Removed message's own on-screen duration.
+constexpr uint32_t kSdMessageMs = 1000;
+
 Framebuffer128x64 g_fb;
 Ssd1306Display g_display;
 GpioExpander g_expander(kExpanderAddr);
@@ -92,10 +103,13 @@ uint32_t millis()
 // Boot-time banner sequence, external to SplashScreen itself (which is a
 // "dumb" screen, see splash_screen.h) -- mirrors control.cpp's
 // splashScreenPoll()/ZULUSCSI_UI_START state machine: this project's own
-// firmware version for 1500ms, then the connection status for 1000ms,
-// then move on to Main. Runs exactly once at boot; later visits to Splash
-// (via Settings' "About") don't re-trigger it since g_bootPhase is
-// already Done by then.
+// firmware version for at least 1500ms, then the connection status for at
+// least 1000ms more -- but the move to Main additionally waits on
+// HasReceivedStatus(), so the splash holds indefinitely if the first real
+// device status hasn't arrived yet by the time that 1000ms elapses, rather
+// than dropping to a still-empty Main screen. Runs exactly once at boot;
+// later visits to Splash (via Settings' "About") don't re-trigger it since
+// g_bootPhase is already Done by then.
 enum class BootPhase
 {
     ShowVersion,
@@ -106,10 +120,70 @@ enum class BootPhase
 BootPhase g_bootPhase = BootPhase::ShowVersion;
 uint32_t g_bootPhaseStartMs = 0;
 
+// "Searching..." is the only thing this banner ever says -- it's only
+// meaningful while the device type is still Unknown. Once it resolves, the
+// logo swap (SplashScreen::draw()'s device_type switch) and the I2C API
+// sub-banner (updateApiSubBanner()) already say everything there is to
+// say, so there's no "Connected: ZuluSCSI"/"Connected: ZuluIDE" text at all
+// -- this just clears the banner instead.
+void updateConnectionBanner(SplashScreen *splash, DeviceType type)
+{
+    splash->setBannerText(type == DeviceType::Unknown ? "Searching..." : "");
+}
+
+// Normally "I2C API vX.X.X" (this client's own version), but if the host's
+// major version doesn't match ours, "API ZS: vA.B.C ZC: vX.X.X" instead --
+// ZS/ZI for the host (ZuluSCSI/ZuluIDE), ZC for this client (ZuluControl) --
+// so a mismatch worth fixing is visible on the boot splash itself, not just
+// in the browser-facing version JSON's "message" field.
+void updateApiSubBanner(SplashScreen *splash)
+{
+    char apiBanner[40];
+    const char *serverVersion = GetServerAPIVersionOnly();
+    if (IsApiVersionMismatch() && serverVersion[0] != '\0')
+    {
+        const char *hostAbbrev = (g_data.GetDeviceType() == DeviceType::ZuluIDE) ? "ZI" : "ZS";
+        snprintf(apiBanner, sizeof(apiBanner), "API %s: v%s ZC: v%s",
+                 hostAbbrev, serverVersion, I2C_API_VERSION);
+    }
+    else
+    {
+        snprintf(apiBanner, sizeof(apiBanner), "I2C API v%s", I2C_API_VERSION);
+    }
+    splash->setSubBannerText(apiBanner);
+}
+
+// The local I2C API version line is deliberately withheld until the host
+// (ZuluSCSI/ZuluIDE) has sent its own API version and g_data.GetDeviceType()
+// resolves away from Unknown -- until then the generic ZuluControl logo is
+// showing (SplashScreen::draw()'s device_type switch), and this project's
+// own API version isn't meaningful information about a device we haven't
+// heard from yet. The moment it resolves, SplashScreen::draw() also starts
+// drawing the real ZuluSCSI/ZuluIDE logo instead, on the very same
+// forceDraw() setSubBannerText() triggers -- so the logo swap and the
+// sub-banner appearing happen together, in one redraw.
+bool g_apiSubBannerSet = false;
+
 void tickBootSequence()
 {
     if (g_bootPhase == BootPhase::Done)
         return;
+
+    if (!g_apiSubBannerSet && g_data.GetDeviceType() != DeviceType::Unknown)
+    {
+        g_apiSubBannerSet = true;
+        auto *splash = static_cast<SplashScreen *>(GetScreen(DisplayScreenType::Splash));
+        updateApiSubBanner(splash);
+
+        if (g_bootPhase == BootPhase::ShowConnectionStatus)
+        {
+            // The device type resolved after this phase's own banner text
+            // was already set to "Searching..." -- clear it now, rather
+            // than leaving it stale next to the now-correct logo and
+            // sub-banner.
+            updateConnectionBanner(splash, g_data.GetDeviceType());
+        }
+    }
 
     uint32_t elapsed = millis() - g_bootPhaseStartMs;
 
@@ -119,20 +193,47 @@ void tickBootSequence()
         g_bootPhaseStartMs = millis();
 
         auto *splash = static_cast<SplashScreen *>(GetScreen(DisplayScreenType::Splash));
-        char banner[40];
-        switch (g_data.GetDeviceType())
-        {
-            case DeviceType::ZuluSCSI: snprintf(banner, sizeof(banner), "Connected: ZuluSCSI"); break;
-            case DeviceType::ZuluIDE: snprintf(banner, sizeof(banner), "Connected: ZuluIDE"); break;
-            default: snprintf(banner, sizeof(banner), "Searching..."); break;
-        }
-        splash->setBannerText(banner);
+        updateConnectionBanner(splash, g_data.GetDeviceType());
     }
-    else if (g_bootPhase == BootPhase::ShowConnectionStatus && elapsed > 1000)
+    else if (g_bootPhase == BootPhase::ShowConnectionStatus && elapsed > 1000 && HasReceivedStatus())
     {
         g_bootPhase = BootPhase::Done;
         ChangeScreen(DisplayScreenType::Main);
     }
+}
+
+// Draws over whatever screen is active, every tick a filenames fetch is in
+// flight (IsFilenamesFetchActive()) -- not just on a state transition like
+// checkSdStatusChange(), since this popup needs to keep showing for the
+// fetch's whole duration. Deliberately not a MessageBox/ChangeScreen(): the
+// server can push a filenames update completely unprompted (e.g. right
+// after boot), with no screen having called RequestFilenames(), so this
+// can't be driven from any one screen's own tick()/draw() -- it has to be
+// a display_task-level overlay that works no matter which screen is
+// showing (Main, Browse, Settings, ...).
+bool g_filenamesFetchWasActive = false;
+
+// True from the moment a fetch finishes until kLoadingHoldMs later -- the
+// popup keeps showing (frozen at the final byte count, since
+// GetFilenamesBytesReceived() isn't reset until the next fetch starts)
+// through this window instead of disappearing the instant the closing
+// sentinel arrives.
+bool g_filenamesHolding = false;
+uint32_t g_filenamesHoldUntilMs = 0;
+
+// True while the filenames-loading popup is either actively fetching or
+// still in its post-fetch hold -- i.e. whenever it's actually visible on
+// screen (modulo the SD-present/MessageBox draw-site checks in
+// overlayFilenamesLoading() itself). IsFilenamesFetchActive() alone isn't
+// enough for callers like checkSdStatusChange(): a fetch with a zero-length
+// payload (e.g. the server clearing its filenames cache right as the SD
+// card is pulled) can go active -> finished within a single display tick,
+// so by the time checkSdStatusChange() next runs, IsFilenamesFetchActive()
+// already reads false even though the popup is still frozen on screen for
+// its hold window -- checking this instead catches that case too.
+bool IsFilenamesPopupActive()
+{
+    return IsFilenamesFetchActive() || g_filenamesHolding;
 }
 
 // Surfaces the status JSON's sdPresent flag -- real information from
@@ -142,6 +243,24 @@ void tickBootSequence()
 // device pushed, not just local warnings).
 bool g_sdPresentKnown = false;
 bool g_lastSdPresent = false;
+
+// Set when an SD status change lands while the filenames-loading overlay
+// (below) is showing, so it can be shown right after that overlay clears
+// instead of ChangeScreen()-ing to MessageBox on top of it (MessageBox
+// only draws its own box, it doesn't clear first, so stacking it over the
+// loading popup would leave a corrupted mix of both on screen).
+bool g_pendingSdMessage = false;
+bool g_pendingSdPresent = false;
+
+void showSdMessage(bool nowPresent)
+{
+    Screen *active = GetActiveScreen();
+    if (!active || active->screenType() == DisplayScreenType::MessageBox)
+        return;  // don't interrupt a message already showing
+
+    ShowMessage("-- Info --", "SD Card", nowPresent ? "Inserted" : "Removed",
+                active->screenType(), active->getOriginalIndex(), kSdMessageMs);
+}
 
 void checkSdStatusChange()
 {
@@ -159,16 +278,122 @@ void checkSdStatusChange()
         return;
     g_lastSdPresent = nowPresent;
 
-    Screen *active = GetActiveScreen();
-    if (!active || active->screenType() == DisplayScreenType::MessageBox)
-        return;  // don't interrupt a message already showing
+    if (IsFilenamesPopupActive())
+    {
+        // Queue it -- overlayFilenamesLoading() shows it once the fetch
+        // (and its post-fetch hold) finishes and the popup is off screen.
+        g_pendingSdMessage = true;
+        g_pendingSdPresent = nowPresent;
+        return;
+    }
 
-    ShowMessage("-- Info --", "SD Card", nowPresent ? "Inserted" : "Removed",
-                active->screenType(), active->getOriginalIndex(), 2000);
+    showSdMessage(nowPresent);
+}
+
+void overlayFilenamesLoading()
+{
+    bool fetchActive = IsFilenamesFetchActive();
+    uint32_t now = millis();
+    bool showPopup = fetchActive;
+
+    if (fetchActive)
+    {
+        g_filenamesFetchWasActive = true;
+        // A new fetch started before the previous hold elapsed (back-to-
+        // back fetches) -- drop the hold and just keep showing progress.
+        g_filenamesHolding = false;
+    }
+    else if (g_filenamesFetchWasActive)
+    {
+        g_filenamesFetchWasActive = false;
+        g_filenamesHolding = true;
+        g_filenamesHoldUntilMs = now + kLoadingHoldMs;
+    }
+
+    if (g_filenamesHolding)
+    {
+        if ((int32_t)(now - g_filenamesHoldUntilMs) < 0)
+        {
+            showPopup = true;  // still holding the completed state visible
+        }
+        else
+        {
+            g_filenamesHolding = false;
+
+            // Hold elapsed -- force a full, synchronous redraw so the
+            // popup's last frame doesn't linger on top of an otherwise-
+            // static screen (mirrors the screen-saver-exit redraw below),
+            // then flush any SD-status message that queued up while the
+            // popup was covering the screen.
+            Screen *screen = GetActiveScreen();
+            if (screen)
+            {
+                screen->forceDraw();
+                screen->tick();
+            }
+            if (g_pendingSdMessage)
+            {
+                g_pendingSdMessage = false;
+                showSdMessage(g_pendingSdPresent);
+            }
+        }
+    }
+
+    if (!showPopup)
+        return;
+
+    if (g_bootPhase != BootPhase::Done)
+        return;  // the version/connection banner owns the screen until then
+
+    Screen *screen = GetActiveScreen();
+    if (!screen || screen->screenType() == DisplayScreenType::MessageBox)
+        return;  // don't stack over a message already showing
+
+    if (!g_data.SdPresent())
+        return;  // nothing meaningful to fetch a file list for without an SD card
+
+    DrawLoadingPopup(&g_fb, "File list Loading", GetFilenamesBytesReceived(), FILENAMES_JSON_CACHE_SIZE);
+}
+
+// Long-press-of-rotary recovery gesture: re-initialize the SSD1306 (in case a
+// glitch on the shared i2c1 bus left the panel mis-configured -- wrong
+// addressing window, charge pump off, garbled pixels) and force the active
+// screen to redraw from scratch, so a corrupted display can be recovered
+// without power-cycling the board. Handled here at the task level rather than
+// in any one Screen so it behaves identically from every screen.
+void resetAndRedrawDisplay()
+{
+    // Drain any in-flight async push first -- Ssd1306Display::Reset()
+    // reconfigures the addressing window, so a page still streaming from the
+    // old frame must not land mid-reconfigure.
+    while (g_display.IsBusy())
+        g_display.Poll();
+
+    g_display.Reset();
+
+    // Reset() only reconfigures the controller; GDDRAM still holds whatever
+    // (possibly garbled) pixels were there. Force the whole frame to be
+    // regenerated and re-pushed even if the framebuffer bytes are unchanged --
+    // g_havePushed = false defeats the change-gate in pollAndPush() so the
+    // full frame is streamed back out.
+    g_havePushed = false;
+
+    Screen *active = GetActiveScreen();
+    if (active)
+        active->forceDraw();  // regenerated + pushed by the normal tick/pollAndPush path
 }
 
 void dispatchInput(const InputEvents &events)
 {
+    // Global display-recovery gesture -- takes precedence over any screen's own
+    // long-rotary handling (see resetAndRedrawDisplay()); consumes the event so
+    // it isn't also delivered to the active screen.
+    if (events.longPress[(int)Button::Rotary])
+    {
+        resetAndRedrawDisplay();
+        return;
+    }
+
     Screen *active = GetActiveScreen();
     if (!active)
         return;
@@ -185,8 +410,6 @@ void dispatchInput(const InputEvents &events)
         active->longEjectPress();
     if (events.longPress[(int)Button::Insert])
         active->longUserPress();
-    if (events.longPress[(int)Button::Rotary])
-        active->longRotaryPress();
 }
 
 bool hasAnyInput(const InputEvents &events)
@@ -234,6 +457,7 @@ bool InitDisplayControl()
     ChangeScreen(DisplayScreenType::Splash);
     g_bootPhase = BootPhase::ShowVersion;
     g_bootPhaseStartMs = millis();
+    g_apiSubBannerSet = false;  // tickBootSequence() sets it once the host's API version resolves the device type
 
     g_initialized = true;
     return true;
@@ -314,6 +538,8 @@ void DisplayControlTask()
         Screen *active = GetActiveScreen();
         if (active)
             active->tick();
+
+        overlayFilenamesLoading();
     }
 
     pollAndPush();

@@ -31,12 +31,19 @@ namespace zuluide::display {
 void SplashScreen::init(int index)
 {
     Screen::init(index);
+    _subBannerText[0] = '\0';  // About's single-line look shouldn't inherit boot's leftover sub-banner
     forceDraw();
 }
 
 void SplashScreen::setBannerText(const char *text)
 {
     snprintf(_bannerText, sizeof(_bannerText), "%s", text);
+    forceDraw();
+}
+
+void SplashScreen::setSubBannerText(const char *text)
+{
+    snprintf(_subBannerText, sizeof(_subBannerText), "%s", text);
     forceDraw();
 }
 
@@ -54,7 +61,15 @@ void SplashScreen::draw()
             _fb->drawBitmap(6, 0, icon_zulu_control_logo, 115, 56);
     }
 
-    printCenteredText(_bannerText, 56);
+    if (_subBannerText[0] != '\0')
+    {
+        printCenteredText(_bannerText, 48);
+        printCenteredText(_subBannerText, 56);
+    }
+    else
+    {
+        printCenteredText(_bannerText, 56);
+    }
 }
 
 void SplashScreen::shortUserPress()

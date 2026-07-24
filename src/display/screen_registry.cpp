@@ -30,6 +30,7 @@
 #include "ide_main_screen.h"
 #include "ide_browse_screen.h"
 #include "ide_settings_screen.h"
+#include "wifi_screen.h"
 #include "about_screen.h"
 #include "menu_screen.h"
 #include "firmware_upgrade_screen.h"
@@ -58,6 +59,7 @@ MessageBox *g_messageBox = nullptr;
 IDEMainScreen *g_ideMain = nullptr;
 IDEBrowseScreen *g_ideBrowse = nullptr;
 IDESettingsScreen *g_ideSettings = nullptr;
+WiFiScreen *g_wifi = nullptr;
 AboutScreen *g_about = nullptr;
 MenuScreen *g_menu = nullptr;
 
@@ -88,6 +90,7 @@ void InitScreens(Framebuffer128x64 *fb, DisplayData *data)
     static IDEMainScreen ideMain(fb, data);
     static IDEBrowseScreen ideBrowse(fb, data);
     static IDESettingsScreen ideSettings(fb, data);
+    static WiFiScreen wifi(fb, data);
     static AboutScreen about(fb);
     static MenuScreen menu(fb);
 
@@ -108,6 +111,7 @@ void InitScreens(Framebuffer128x64 *fb, DisplayData *data)
     g_ideMain = &ideMain;
     g_ideBrowse = &ideBrowse;
     g_ideSettings = &ideSettings;
+    g_wifi = &wifi;
     g_about = &about;
     g_menu = &menu;
     g_infoPage2 = &infoPage2;
@@ -126,7 +130,13 @@ Screen *GetScreen(DisplayScreenType type)
         case DisplayScreenType::Splash: return g_splash;
         case DisplayScreenType::Main: return isIde() ? (Screen *)g_ideMain : (Screen *)g_main;
         case DisplayScreenType::Browse: return isIde() ? (Screen *)g_ideBrowse : (Screen *)g_browse;
-        case DisplayScreenType::Settings: return isIde() ? (Screen *)g_ideSettings : (Screen *)g_settings;
+        // Both device types now use the ZuluIDE settings screen (Scroll step +
+        // Screen saver rows). The task asks the ZuluSCSI control board to
+        // "import the settings screen from the ZuluIDE control board", so the
+        // SCSI-only SettingsScreen (About-only) is no longer routed to; the
+        // About banner stays reachable through SplashScreen elsewhere.
+        case DisplayScreenType::Settings: return g_ideSettings;
+        case DisplayScreenType::WiFi: return g_wifi;
         case DisplayScreenType::Info: return g_info;
         case DisplayScreenType::About: return g_about;
         case DisplayScreenType::Menu: return g_menu;

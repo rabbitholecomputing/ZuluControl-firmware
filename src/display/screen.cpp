@@ -25,6 +25,56 @@
 
 namespace zuluide::display {
 
+namespace {
+
+// Short "12B"/"4kB" style formatting (no decimal point -- see
+// DrawLoadingPopup's header comment for why this differs from
+// Screen::makeImageSizeStr's one-decimal "4.0k" form): whole bytes below
+// 1024, whole kB (rounded to the nearest, not truncated, so e.g. 1023
+// bytes reads "1kB" rather than a confusing "0kB") at or above it.
+void formatBytesShort(size_t bytes, char *out, size_t outSize)
+{
+    if (bytes < 1024)
+        snprintf(out, outSize, "%zuB", bytes);
+    else
+        snprintf(out, outSize, "%zukB", (bytes + 512) / 1024);
+}
+
+}  // namespace
+
+void DrawLoadingPopup(Framebuffer128x64 *fb, const char *message, size_t bytesTransferred, size_t totalBytes)
+{
+    // Wider than MessageBox's box (kBoxW=98) so a full-width message like
+    // "File list Loading" fits on one line without wrapping/ellipsizing.
+    constexpr int kBoxX = 4, kBoxY = 14, kBoxW = 120, kBoxH = 36;
+
+    fb->fillRect(kBoxX, kBoxY, kBoxW, kBoxH, false);
+    fb->drawRectOutline(kBoxX + 2, kBoxY + 2, kBoxW - 4, kBoxH - 4);
+
+    auto centered = [fb](const char *text, int y)
+    {
+        int w = Framebuffer128x64::textWidth(text);
+        int x = (Framebuffer128x64::WIDTH - w) / 2;
+        if (x < 0) x = 0;
+        fb->drawText(x, y, text);
+    };
+
+    centered(message, kBoxY + 9);
+
+    // "<received>/<total>" e.g. "12B/32kB" while filling the buffer, then
+    // e.g. "4kB/32kB" once the fetch's closing sentinel arrives -- `total`
+    // is the destination buffer's fixed capacity (FILENAMES_JSON_CACHE_SIZE),
+    // not a per-fetch expected size (the server doesn't report one), so it
+    // reads as "how much of the buffer got used", not literal progress.
+    char receivedStr[16], totalStr[16];
+    formatBytesShort(bytesTransferred, receivedStr, sizeof(receivedStr));
+    formatBytesShort(totalBytes, totalStr, sizeof(totalStr));
+
+    char bytesText[32];
+    snprintf(bytesText, sizeof(bytesText), "%s/%s", receivedStr, totalStr);
+    centered(bytesText, kBoxY + 21);
+}
+
 void Screen::printCenteredText(const char *text, int y)
 {
     int w = Framebuffer128x64::textWidth(text);
