@@ -86,6 +86,14 @@ const char *GetFilenamesJson(int scsiId);
 // below is still returning false.
 size_t GetFilenamesBytesReceived();
 
+// Bytes of the single shared filenames cache buffer currently occupied by the
+// cached JSON of every scsi id together (ZuluIDE only ever fills slot 0) --
+// i.e. how much of FILENAMES_JSON_CACHE_SIZE is in use. Unlike
+// GetFilenamesBytesReceived() above (raw payload of the latest fetch alone),
+// this is cumulative across ids and counts the JSON framing written around the
+// payload. Backs the Usage screen's cache readout.
+size_t GetFilenamesCacheBytesUsed();
+
 // True while a filenames fetch is actually in flight (server has
 // acknowledged/started sending, i.e. ProcessUpdateFilenames() through the
 // closing sentinel in ProcessFilename()). Unlike RequestFilenames(), this

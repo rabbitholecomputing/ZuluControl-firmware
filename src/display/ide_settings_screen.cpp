@@ -33,11 +33,29 @@ constexpr int kRow0Y = 16;
 constexpr int kRowStep = 12;
 constexpr int kTextX = 12;
 
-enum { kRowScroll = 0, kRowSaver = 1, kRowWiFi = 2 };
+// Row order -- "Usage" sits directly above "About", the last row.
+enum { kRowScroll = 0, kRowSaver = 1, kRowWiFi = 2, kRowUsage = 3, kRowAbout = 4 };
 
 // Menu tags passed to ShowMenu(), distinguished in onMenuAction().
 enum { kMenuScroll = 0, kMenuSaver = 1 };
 constexpr int kMenuScale = 1;
+
+// Scroll indicators for the row viewport, in the same visual language as
+// PopupMenu's (popup_menu.cpp): a small filled triangle pointing the way the
+// list continues. `down` true points down (widest at top).
+constexpr int kTriW = 7, kTriH = 4;
+constexpr int kTriX = Framebuffer128x64::WIDTH - kTriW - 2;
+
+void drawTriangle(Framebuffer128x64 *fb, int x, int y, int w, int h, bool down)
+{
+    for (int r = 0; r < h; r++)
+    {
+        int shrink = down ? r : (h - 1 - r);
+        int lineW = w - 2 * shrink;
+        if (lineW > 0)
+            fb->drawHLine(x + shrink, y + r, lineW);
+    }
+}
 }  // namespace
 
 void IDESettingsScreen::init(int index)
@@ -45,6 +63,7 @@ void IDESettingsScreen::init(int index)
     Screen::init(index);
     _data->Refresh();
     _selected = 0;
+    _top = 0;
     forceDraw();
 }
 
@@ -65,21 +84,34 @@ void IDESettingsScreen::draw()
     else
         _fb->drawBitmap(115, 0, icon_nosd, 12, 12);
 
-    char line[28];
+    // More rows than fit the viewport, so only kVisibleRows of them are drawn,
+    // starting at _top (kept covering _selected by clampScroll()).
+    char scrollLine[28], saverLine[28];
+    snprintf(scrollLine, sizeof(scrollLine), "Scroll: %d", GetScrollStep());
+    snprintf(saverLine, sizeof(saverLine), "Saver: %s", ScreenSaverName(GetConfiguredScreenSaver()));
 
-    snprintf(line, sizeof(line), "Scroll: %d", GetScrollStep());
-    if (_selected == kRowScroll)
-        _fb->drawBitmap(2, kRow0Y, icon_select, 8, 8);
-    _fb->drawText(kTextX, kRow0Y, line);
+    const char *labels[kRowCount];
+    labels[kRowScroll] = scrollLine;
+    labels[kRowSaver] = saverLine;
+    labels[kRowWiFi] = "WiFi";
+    labels[kRowUsage] = "Usage";
+    labels[kRowAbout] = "About";
 
-    snprintf(line, sizeof(line), "Saver: %s", ScreenSaverName(GetConfiguredScreenSaver()));
-    if (_selected == kRowSaver)
-        _fb->drawBitmap(2, kRow0Y + kRowStep, icon_select, 8, 8);
-    _fb->drawText(kTextX, kRow0Y + kRowStep, line);
+    for (int row = 0; row < kVisibleRows; row++)
+    {
+        int idx = _top + row;
+        if (idx >= kRowCount)
+            break;
+        int y = kRow0Y + row * kRowStep;
+        if (idx == _selected)
+            _fb->drawBitmap(2, y, icon_select, 8, 8);
+        _fb->drawText(kTextX, y, labels[idx]);
+    }
 
-    if (_selected == kRowWiFi)
-        _fb->drawBitmap(2, kRow0Y + kRowStep * 2, icon_select, 8, 8);
-    _fb->drawText(kTextX, kRow0Y + kRowStep * 2, "WiFi");
+    if (_top > 0)
+        drawTriangle(_fb, kTriX, kRow0Y + 1, kTriW, kTriH, false);
+    if (_top + kVisibleRows < kRowCount)
+        drawTriangle(_fb, kTriX, kRow0Y + kRowStep * (kVisibleRows - 1) + 2, kTriW, kTriH, true);
 
     _fb->drawText(0, 52, "push:edit  usr:back");
 }
@@ -142,6 +174,22 @@ void IDESettingsScreen::shortRotaryPress()
         openSaverMenu();
     else if (_selected == kRowWiFi)
         ChangeScreen(DisplayScreenType::WiFi, getOriginalIndex());
+    else if (_selected == kRowUsage)
+        ChangeScreen(DisplayScreenType::Usage, getOriginalIndex());
+    else if (_selected == kRowAbout)
+        ChangeScreen(DisplayScreenType::About, getOriginalIndex());
+}
+
+void IDESettingsScreen::clampScroll()
+{
+    // Same rule as PopupMenu::clampScroll(): pull the viewport just far enough
+    // to cover _selected, which also lands it correctly after a wrap-around.
+    if (_selected < _top)
+        _top = _selected;
+    else if (_selected >= _top + kVisibleRows)
+        _top = _selected - kVisibleRows + 1;
+    if (_top < 0)
+        _top = 0;
 }
 
 void IDESettingsScreen::rotaryChange(int direction)
@@ -150,6 +198,7 @@ void IDESettingsScreen::rotaryChange(int direction)
         _selected = (_selected + 1) % kRowCount;
     else if (direction < 0)
         _selected = (_selected - 1 + kRowCount) % kRowCount;
+    clampScroll();
     forceDraw();
 }
 

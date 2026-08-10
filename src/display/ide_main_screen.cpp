@@ -179,7 +179,7 @@ void IDEMainScreen::draw()
     {
         // Ejected == no image loaded on ZuluIDE -- surface that state
         // explicitly rather than leaving the line blank.
-        printCenteredText("-- Ejected --", 28);
+        printCenteredText("-- Ejected --", 16);
     }
     else
     {

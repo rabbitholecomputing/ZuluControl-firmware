@@ -24,7 +24,7 @@
           </div>
           <div id='ide-si' class='hdn'>
             <select id='ide-newImg'></select><br/>
-            <button class='load' onclick='ideLoadClicked()'>Load</button><button class='cancel' onclick='ideCancelClicked()' style='float:right;'>Cancel</button>
+            <button id='ide-si-load' class='load' onclick='ideLoadClicked()' disabled>Load</button><button class='cancel' onclick='ideCancelClicked()' style='float:right;'>Cancel</button>
           </div>
         </div>
       </div>
@@ -40,7 +40,7 @@
           <div id='scsi-si' class='hdn'>
             <h3>Select Image - ID <span id='scsi-si-id'></span> (<span id='scsi-si-type'></span>)</h3>
             <select id='scsi-newImg'></select><br/>
-            <button class='load' onclick='scsiLoadClicked()'>Load</button><button class='cancel' onclick='scsiCancelClicked()' style='float:right;'>Cancel</button>
+            <button id='scsi-si-load' class='load' onclick='scsiLoadClicked()' disabled>Load</button><button class='cancel' onclick='scsiCancelClicked()' style='float:right;'>Cancel</button>
           </div>
         </div>
       </div>
@@ -72,7 +72,11 @@
         ZuluControl-firmware <span id='cfv'></span><br/>
         I2C API versions: ZuluControl <span id='cav'></span>, <span id='sdt'>ZuluIDE/SCSI</span> <span id='sav'></span><br/>
         <span id='avm'></span>
-        <a href='fw_upgrade.html'>Upload ZuluControl-firmware here...</a>
+        <a href='fw_upgrade.html'>Upload ZuluControl-firmware here...</a><br/>
+        <div id='usage'>
+           Filename cache<span id='ufc-loading'> (Loading...)</span>: <span id='ufc'></span><br/>
+          Cache index: <span id='uci'></span>
+        </div>
       </div>
     </div>
   </body>

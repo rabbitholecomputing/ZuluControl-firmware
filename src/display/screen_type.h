@@ -55,6 +55,10 @@ enum class DisplayScreenType
     // / connection-error variant), reached from the Settings screen's "WiFi"
     // row. Backed by the control board's own RM2 radio state (see wifi_screen.h).
     WiFi,
+    // Read-only filename-cache usage page (bytes used of the filenames JSON
+    // buffer, images indexed of the filename index's capacity), reached from
+    // the Settings screen's "Usage" row -- see usage_screen.h.
+    Usage,
 };
 
 }  // namespace zuluide::display

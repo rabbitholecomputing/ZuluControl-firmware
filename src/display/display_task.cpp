@@ -443,6 +443,16 @@ void pollAndPush()
 
 }  // namespace
 
+int GetFilenameIndexUsed()
+{
+    return g_data.IndexedFilenameTotal();
+}
+
+int GetFilenameIndexCapacity()
+{
+    return DisplayData::MAX_FILENAME_INDEX;
+}
+
 bool InitDisplayControl()
 {
     if (!g_display.Init(i2c1, kSdaPin, kSclPin, kBaudrate, kDisplayAddr))
@@ -465,10 +475,17 @@ bool InitDisplayControl()
 
 void DisplayControlTask()
 {
+    // Kept ahead of the g_initialized guard: DisplayData is a pure parse of the
+    // JSON webui_data.h already caches -- it touches neither the panel nor i2c1
+    // -- and its filename index also backs the web UI's /usage.json. Behind the
+    // guard, a board with no control panel attached (InitDisplayControl()
+    // having returned false) never rebuilt the index at all, so that endpoint's
+    // "imagesUsed" -- the UI's "Cache index" line -- read 0 forever no matter
+    // how many filenames were actually cached.
+    g_data.Refresh();
+
     if (!g_initialized)
         return;
-
-    g_data.Refresh();
 
     // Firmware upgrade in progress: the "Firmware Upgrade" progress screen
     // takes over the panel until the board reboots into the new image (or the

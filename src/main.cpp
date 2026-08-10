@@ -21,6 +21,7 @@
 
 #include <hardware/watchdog.h>
 #include <pico/i2c_slave.h>
+#include <pico/stdio_usb.h>
 #include <pico/stdlib.h>
 #include <pico/util/queue.h>
 #include <pico/multicore.h>
@@ -98,6 +99,24 @@ static size_t g_filenames_bytes_received = 0;
 
 static volatile FilenameCacheState filenameState = FilenameCacheState::Idle;
 
+// Drops every cached filenames segment -- and the buffer usage they account for
+// -- putting the cache back in its power-on state. Any fetch in flight is
+// abandoned rather than completed: with g_filenames_active_id back at 0xFF,
+// ProcessFilename() discards the remaining chunks (including the closing
+// sentinel), and the next /filenames request starts a fresh fetch from Idle.
+static void ClearFilenamesCache()
+{
+    memset(filenames_json, 0, sizeof(filenames_json));
+    for (int i = 0; i < MAX_SCSI_IDS; i++) g_filenames_scsi_id[i] = nullptr;
+    g_filenames_write_ptr = filenames_json;
+    g_filenames_id_start = nullptr;
+    g_filenames_overflow = false;
+    g_filenames_active_id = 0xFF;
+    g_filenames_serving_id = 0xFF;
+    g_filenames_bytes_received = 0;
+    filenameState = FilenameCacheState::Idle;
+}
+
 // ── Image/iterator cache ──────────────────────────────────────────────────────
 
 enum class ImageCacheState { Idle, Fetching, Full, Iterating, IteratingFinished };
@@ -145,6 +164,11 @@ const char *GetFilenamesJson(int scsiId)
 }
 
 size_t GetFilenamesBytesReceived() { return g_filenames_bytes_received; }
+
+size_t GetFilenamesCacheBytesUsed()
+{
+    return (size_t)(g_filenames_write_ptr - filenames_json);
+}
 
 bool IsFilenamesFetchActive()
 {
@@ -495,6 +519,18 @@ void ProcessUpdateFilenames(const uint8_t *message, size_t length)
         g_filenames_write_ptr = filenames_json;
         g_filenames_overflow = false;
     }
+    else if (g_device_type != zulucontrol::config::DeviceType::ZuluSCSI) {
+        // ZuluIDE only ever occupies slot 0, so there is no other ID's segment
+        // to preserve and a re-fetch can rewind the whole buffer -- which it
+        // MUST: the write pointer only ever moves forward, so without this each
+        // refresh appended another complete copy of the same list, growing the
+        // cache until it overflowed and stranding the display's filename index
+        // (see the ZuluIDE branch of cgi_handler_filenames, which re-requests
+        // on every call once the cache is Full).
+        memset(filenames_json, 0, sizeof(filenames_json));
+        g_filenames_scsi_id[0] = nullptr;
+        g_filenames_write_ptr = filenames_json;
+    }
 
     printf("Beginning filename cache update for %s ID %u\n",
            g_device_type == zulucontrol::config::DeviceType::ZuluSCSI ? "SCSI" : "IDE", incoming_id);
@@ -690,8 +726,25 @@ void ProcessDeviceList(const uint8_t *message, size_t length)
 void ProcessSDStatus(const uint8_t *message, size_t length)
 {
     if (length < 1) return;
-    g_sd_present = (message[0] == I2C_SERVER_SD_PRESENT);
-    printf("SD card %s\n", g_sd_present ? "present" : "not present");
+    bool present = (message[0] == I2C_SERVER_SD_PRESENT);
+    printf("SD card %s\n", present ? "present" : "not present");
+
+    // Either transition invalidates the cache, so drop it along with the usage
+    // it accounts for. On removal the cached filenames describe files that are
+    // no longer reachable -- the web UI and control panel would keep offering
+    // images that can't be loaded, and the Usage screen would keep reporting a
+    // full cache for a card that isn't there. On insertion they describe the
+    // *previous* card, which is just as wrong, and nothing else forces a
+    // refetch. Either way the next /filenames request refills it from the new
+    // card, and the display's filename index follows on its next
+    // DisplayData::Refresh(), which notices every id's JSON changed.
+    if (g_sd_present != present)
+    {
+        printf("Clearing filename cache after SD card %s\n", present ? "insertion" : "removal");
+        ClearFilenamesCache();
+    }
+
+    g_sd_present = present;
 }
 
 void ProcessUpgradeFirmwareRequest(const uint8_t* message, size_t length) {
@@ -838,6 +891,11 @@ static const char *cgi_handler_filenames(int index, int numParams, char *pcParam
             if (!zuluide::i2c::client::EnqueueRequest(I2C_CLIENT_FETCH_FILENAMES)) {
                 printf("Failed to add fetch filenames to output queue.\n");
             }
+        // Overflow is deliberately NOT re-requested here (unlike the ZuluSCSI
+        // branch above): it falls through to the "/overflow.json" return below,
+        // which is what steers the client onto the nextImage iterator for a list
+        // too big to cache. ProcessSDStatus's ClearFilenamesCache() is what
+        // takes the state back to Idle when the card next changes.
         } else if (filenameState == FilenameCacheState::Idle) {
             if (!zuluide::i2c::client::EnqueueRequest(I2C_CLIENT_FETCH_FILENAMES)) {
                 printf("Failed to add fetch filenames to output queue.\n");
@@ -994,6 +1052,12 @@ static const char *cgi_handler_device_list(int index, int numParams, char *param
     return "/devicelist.json";
 }
 
+static const char *cgi_handler_usage(int index, int numParams, char *params[], char *values[]) {
+    // Nothing to request from the device -- both figures are local to this
+    // board and are built on demand in fs_open_custom().
+    return "/usage.json";
+}
+
 static const tCGI cgi_handlers[] = {
     {"/version",     cgi_handler_version},
     {"/status",      cgi_handler_status},
@@ -1004,6 +1068,7 @@ static const tCGI cgi_handlers[] = {
     {"/nextImage",   cgi_handler_next_image},
     {"/insertMedia", cgi_handler_insert_media},
     {"/deviceList",  cgi_handler_device_list},
+    {"/usage",       cgi_handler_usage}
 };
 
 // ── POST handlers (firmware upgrade) ─────────────────────────────────────────
@@ -1131,6 +1196,34 @@ static bool has_elapsed(uint32_t start, uint32_t elapsed) {
     return (uint32_t)(millis() - start) > elapsed;
 }
 
+// ── USB console banner ────────────────────────────────────────────────────────
+
+// Prints our firmware and I2C API versions to the USB console every time a host
+// opens the CDC port.  The versions are already printed at boot, but nothing is
+// listening then -- the host normally attaches long afterwards -- so we repeat
+// them on each new connection.  The banner is delayed slightly after the
+// connection is detected because some host terminals drop bytes sent
+// immediately on open (see PICO_STDIO_USB_POST_CONNECT_WAIT_DELAY_MS).
+static void usb_console_task() {
+    static bool was_connected = false;
+    static bool banner_pending = false;
+    static uint32_t connected_time = 0;
+
+    bool connected = stdio_usb_connected();
+
+    if (connected != was_connected) {
+        was_connected = connected;
+        banner_pending = connected;
+        connected_time = millis();
+    }
+
+    if (banner_pending && has_elapsed(connected_time, PICO_STDIO_USB_POST_CONNECT_WAIT_DELAY_MS)) {
+        banner_pending = false;
+        printf("ZuluControl firmware version: %s\n", FW_VERSION);
+        printf("ZuluControl I2C API version: v%s\n", I2C_API_VERSION);
+    }
+}
+
 void start_multicore_i2c() {
     multicore_launch_core1(core1_main);
     uint32_t g = multicore_fifo_pop_blocking();
@@ -1157,6 +1250,8 @@ int main() {
 
     stdio_init_all();
     printf("Starting.\n");
+    printf("ZuluControl firmware version: %s\n", FW_VERSION);
+    printf("ZuluControl I2C API version: v%s\n", I2C_API_VERSION);
 
     memset(currentStatus, 0, MAX_MSG_SIZE);
     memset(versionJson, '\0', MAX_MSG_SIZE);
@@ -1186,6 +1281,7 @@ int main() {
     State last_state = State::Unknown;
 
     while (true) {
+        usb_console_task();
         zuluide::display::DisplayControlTask();
 
         // Startup blink
@@ -1483,6 +1579,21 @@ int fs_open_custom(struct fs_file *file, const char *name) {
         return get_file_contents(file, versionJson, strlen(versionJson));
     } else if (strncmp(name, "/devicelist.json", sizeof("/devicelist.json")) == 0) {
         return get_file_contents(file, deviceListJson, strlen(deviceListJson));
+    } else if (strncmp(name, "/usage.json", sizeof("/usage.json")) == 0) {
+        // "done" is false while a filenames fetch is still streaming in -- the
+        // figures below are then a snapshot of a cache that is still filling
+        // and will keep changing; true once nothing is in flight and they have
+        // settled, which is the web UI's cue to stop polling.
+        static char usageBuf[192];
+        snprintf(usageBuf, sizeof(usageBuf),
+                 "{\"done\":%s,"
+                 "\"filenameCache\":{\"bytesUsed\":%zu,\"bytesTotal\":%u},"
+                 "\"filenameIndex\":{\"imagesUsed\":%d,\"imagesTotal\":%d}}",
+                 IsFilenamesFetchActive() ? "false" : "true",
+                 GetFilenamesCacheBytesUsed(), (unsigned)FILENAMES_JSON_CACHE_SIZE,
+                 zuluide::display::GetFilenameIndexUsed(),
+                 zuluide::display::GetFilenameIndexCapacity());
+        return get_file_contents(file, usageBuf, strlen(usageBuf));
     } else {
         printf("Unable to find %s\n", name);
         return 0;

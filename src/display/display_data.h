@@ -129,6 +129,12 @@ public:
     // call to make first.
     int IndexedFilenameCount(int scsiId) const;
 
+    // Entries used across every scsi id's slice of the combined index, out of
+    // the MAX_FILENAME_INDEX the array holds -- the "images indexed" figure the
+    // Usage screen shows. Equal to the last device's end offset, since
+    // rebuildFilenameIndex() lays the slices out back-to-back from 0.
+    int IndexedFilenameTotal() const { return _scsiIdIndexEnd[MAX_DEVICES - 1]; }
+
     // Extracts filename index entry `index` (0-based within `scsiId`'s own
     // [start,end) slice, i.e. exactly the range IndexedFilenameCount(scsiId)
     // describes) directly from that device's cached JSON via its indexed

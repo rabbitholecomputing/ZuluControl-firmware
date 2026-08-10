@@ -57,4 +57,12 @@ void DisplayControlTask();
 // panel is present.
 void PumpFirmwareUpgradeDisplay();
 
+// Fill level of the display module's combined filename index (display_data.h):
+// entries used across every scsi id, and the array's fixed capacity. Kept
+// current by the display task's own DisplayData::Refresh(); both read as 0 /
+// the capacity before InitDisplayControl() has run. Read-only, no I2C traffic
+// -- backs the Usage screen's index line and the web UI's /usage.json.
+int GetFilenameIndexUsed();
+int GetFilenameIndexCapacity();
+
 }  // namespace zuluide::display

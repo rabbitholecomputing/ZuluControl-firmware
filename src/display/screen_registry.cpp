@@ -31,6 +31,7 @@
 #include "ide_browse_screen.h"
 #include "ide_settings_screen.h"
 #include "wifi_screen.h"
+#include "usage_screen.h"
 #include "about_screen.h"
 #include "menu_screen.h"
 #include "firmware_upgrade_screen.h"
@@ -60,6 +61,7 @@ IDEMainScreen *g_ideMain = nullptr;
 IDEBrowseScreen *g_ideBrowse = nullptr;
 IDESettingsScreen *g_ideSettings = nullptr;
 WiFiScreen *g_wifi = nullptr;
+UsageScreen *g_usage = nullptr;
 AboutScreen *g_about = nullptr;
 MenuScreen *g_menu = nullptr;
 
@@ -91,6 +93,7 @@ void InitScreens(Framebuffer128x64 *fb, DisplayData *data)
     static IDEBrowseScreen ideBrowse(fb, data);
     static IDESettingsScreen ideSettings(fb, data);
     static WiFiScreen wifi(fb, data);
+    static UsageScreen usage(fb, data);
     static AboutScreen about(fb);
     static MenuScreen menu(fb);
 
@@ -112,6 +115,7 @@ void InitScreens(Framebuffer128x64 *fb, DisplayData *data)
     g_ideBrowse = &ideBrowse;
     g_ideSettings = &ideSettings;
     g_wifi = &wifi;
+    g_usage = &usage;
     g_about = &about;
     g_menu = &menu;
     g_infoPage2 = &infoPage2;
@@ -137,6 +141,7 @@ Screen *GetScreen(DisplayScreenType type)
         // About banner stays reachable through SplashScreen elsewhere.
         case DisplayScreenType::Settings: return g_ideSettings;
         case DisplayScreenType::WiFi: return g_wifi;
+        case DisplayScreenType::Usage: return g_usage;
         case DisplayScreenType::Info: return g_info;
         case DisplayScreenType::About: return g_about;
         case DisplayScreenType::Menu: return g_menu;
