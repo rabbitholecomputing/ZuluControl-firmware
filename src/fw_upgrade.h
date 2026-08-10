@@ -21,6 +21,7 @@
 
 #pragma once
 
+#include <stdint.h>
 #include "lwip/apps/httpd.h"
 
 // This module defines handlers for HTTP POST requests used for firmware upgrade
@@ -36,8 +37,36 @@ err_t fwupgrade_post_receive_data(void *connection, struct pbuf *p);
 // Called from http_post_finished
 void fwupgrade_post_finished(void *connection, char *response_uri, u16_t response_uri_len);
 
+// Snapshot of firmware-upgrade progress, for the local control-panel display.
+// Both the HTTP (web) and I2C upgrade paths funnel through handle_uf2_block(),
+// so this single set of counters covers both. Populated by fwupgrade_get_status();
+// safe to read from core0's display task (the fields are plain 32-bit words).
+struct FwUpgradeStatus
+{
+    bool     active;         // an upgrade is underway: begin seen, not yet finished/aborted
+    bool     via_http;       // true = web (HTTP POST) upload, false = I2C from the host
+    // Full-file upload progress measured in *bytes actually received*, not the
+    // UF2's own block numbering. A universal .uf2 concatenates two independently
+    // numbered family images (block_no restarts, num_blocks differs, and the
+    // blocks are interleaved -- see universal_binary/CMakeLists.txt), so a
+    // block-number-based bar can't sweep cleanly. Byte counters are monotonic
+    // and layout-agnostic, so the bar tracks the whole file to 100% for any
+    // image. (The flashing logic still keys off the family-matching subset.)
+    uint64_t bytes_received; // firmware bytes received so far
+    uint64_t total_bytes;    // total file size; 0 while still unknown
+    uint32_t retries;        // staged chunks discarded and re-requested (I2C RETRY)
+    uint32_t errors;         // UF2 blocks that failed to program/validate
+};
+
+// Copies the current firmware-upgrade progress into `out`.
+void fwupgrade_get_status(FwUpgradeStatus *out);
+
 // These are the functions that upgrade over I2C
 void fwupgrade_i2c_begin();
+
+// Resets progress and marks the upgrade inactive *without* committing anything
+// -- the I2C ABORT path (distinct from begin(), which starts a fresh upgrade).
+void fwupgrade_i2c_abort();
 
 // Copies `data` (a chunk just received over I2C, not yet confirmed good) into
 // the staging buffer. Pure memcpy + bookkeeping, no flash access -- safe to

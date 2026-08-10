@@ -21,6 +21,7 @@
 
 #include <hardware/watchdog.h>
 #include <pico/i2c_slave.h>
+#include <pico/stdio_usb.h>
 #include <pico/stdlib.h>
 #include <pico/util/queue.h>
 #include <pico/multicore.h>
@@ -35,6 +36,8 @@
 #include "ZuluControlI2CClient.h"
 #include "index_html.h"
 #include "fw_upgrade.h"
+#include "webui_data.h"
+#include "display/display_task.h"
 #include "lwip/apps/fs.h"
 #include "lwip/apps/httpd.h"
 #include "lwip/def.h"
@@ -43,8 +46,11 @@
 #include "lwip/init.h"
 #include "lwip/netif.h"
 #include "lwip/dhcp.h"
+#include "lwip/tcp.h"
+#include "lwip/priv/tcp_priv.h"  // tcp_listen_pcbs / tcp_active_pcbs -- for restarting httpd
 #include "pico/cyw43_arch.h"
 #include "url_decode.h"
+#include "ZuluControl_config.h"
 
 static const uint I2C_SLAVE_ADDRESS = 0x45;
 static const uint I2C_BAUDRATE = 400000;  // 400 kHz (Fast Mode)
@@ -62,8 +68,7 @@ static bool g_board_type_b = false;
 
 // ── Device type / SD status ───────────────────────────────────────────────────
 
-enum class DeviceType { Unknown, ZuluIDE, ZuluSCSI };
-static DeviceType g_device_type = DeviceType::Unknown;
+zulucontrol::config::DeviceType g_device_type = zulucontrol::config::DeviceType::Unknown;
 static bool g_sd_present = false;
 
 // ── Filename cache ────────────────────────────────────────────────────────────
@@ -86,8 +91,31 @@ static bool  g_filenames_overflow = false;
 static uint8_t g_filenames_active_id = 0xFF;
 // SCSI ID whose pointer to serve for the next /filenames.json response.
 static uint8_t g_filenames_serving_id = 0xFF;
+// Raw payload bytes received for the fetch currently (or most recently) in
+// progress -- reset each time ProcessUpdateFilenames() starts a new fetch,
+// accumulated in ProcessFilename() -- lets the display show fetch progress
+// (see GetFilenamesBytesReceived()).
+static size_t g_filenames_bytes_received = 0;
 
 static volatile FilenameCacheState filenameState = FilenameCacheState::Idle;
+
+// Drops every cached filenames segment -- and the buffer usage they account for
+// -- putting the cache back in its power-on state. Any fetch in flight is
+// abandoned rather than completed: with g_filenames_active_id back at 0xFF,
+// ProcessFilename() discards the remaining chunks (including the closing
+// sentinel), and the next /filenames request starts a fresh fetch from Idle.
+static void ClearFilenamesCache()
+{
+    memset(filenames_json, 0, sizeof(filenames_json));
+    for (int i = 0; i < MAX_SCSI_IDS; i++) g_filenames_scsi_id[i] = nullptr;
+    g_filenames_write_ptr = filenames_json;
+    g_filenames_id_start = nullptr;
+    g_filenames_overflow = false;
+    g_filenames_active_id = 0xFF;
+    g_filenames_serving_id = 0xFF;
+    g_filenames_bytes_received = 0;
+    filenameState = FilenameCacheState::Idle;
+}
 
 // ── Image/iterator cache ──────────────────────────────────────────────────────
 
@@ -115,6 +143,76 @@ char ipBuffer[32] = {0};
 
 static char versionJson[MAX_MSG_SIZE];
 static char currentStatus[MAX_MSG_SIZE];
+// True from the first ProcessSystemStatus() call onward -- distinguishes
+// "no status received yet" from "server pushed an empty/degenerate status",
+// which an empty currentStatus[] can't (see HasReceivedStatus()).
+static bool g_status_received = false;
+
+// ── Accessors for src/display's read-only view of the cached JSON above (see webui_data.h) ──
+
+const char *GetCurrentStatusJson() { return currentStatus; }
+bool GetSdPresent() { return g_sd_present; }
+bool HasReceivedStatus() { return g_status_received; }
+const char *GetVersionJson() { return versionJson; }
+const char *GetDeviceListJson() { return deviceListJson; }
+
+const char *GetFilenamesJson(int scsiId)
+{
+    if (scsiId < 0 || scsiId >= (int)MAX_SCSI_IDS)
+        return "";
+    return g_filenames_scsi_id[scsiId] ? g_filenames_scsi_id[scsiId] : "";
+}
+
+size_t GetFilenamesBytesReceived() { return g_filenames_bytes_received; }
+
+size_t GetFilenamesCacheBytesUsed()
+{
+    return (size_t)(g_filenames_write_ptr - filenames_json);
+}
+
+bool IsFilenamesFetchActive()
+{
+    return filenameState == FilenameCacheState::Start || filenameState == FilenameCacheState::Fetching;
+}
+
+bool RequestFilenames(int scsiId)
+{
+    if (g_device_type == zulucontrol::config::DeviceType::ZuluSCSI)
+    {
+        if (scsiId < 0 || scsiId >= (int)MAX_SCSI_IDS)
+            return false;
+
+        // Cache hit: this ID has a valid pointer and no overflow has occurred.
+        if (g_filenames_scsi_id[scsiId] != nullptr && !g_filenames_overflow)
+            return true;
+
+        // A fetch is already in progress for this exact ID -- wait for it.
+        if (g_filenames_active_id == scsiId)
+            return false;
+
+        // Cache miss with no active fetch: request from the server.
+        if (filenameState == FilenameCacheState::Idle || filenameState == FilenameCacheState::Overflow)
+        {
+            g_filenames_active_id = (uint8_t)scsiId;
+            uint8_t payload[1] = {(uint8_t)scsiId};
+            zuluide::i2c::client::EnqueueRequestBinary(I2C_CLIENT_FETCH_FILENAMES, payload, 1);
+        }
+        return false;
+    }
+    else
+    {
+        // ZuluIDE: single-device, always slot 0.
+        if (g_filenames_scsi_id[0] != nullptr && !g_filenames_overflow)
+            return true;
+
+        if (filenameState == FilenameCacheState::Idle)
+        {
+            zuluide::i2c::client::EnqueueRequest(I2C_CLIENT_FETCH_FILENAMES);
+            filenameState = FilenameCacheState::Fetching;
+        }
+        return false;
+    }
+}
 
 // ── WiFi credentials ──────────────────────────────────────────────────────────
 
@@ -122,6 +220,14 @@ static std::string wifiPass;
 static bool wifiPassSet = false;
 static std::string wifiSSID;
 static std::string serverAPIVersion;
+// Just the version portion of serverAPIVersion (up to the first space,
+// e.g. "4.0.0" out of "4.0.0 ZuluSCSI") -- what the splash screen's
+// mismatch banner shows, since the device name is shown separately there.
+static std::string serverAPIVersionOnly;
+// True once ProcessServerAPIVersion() has run and the server's major
+// version didn't match ours (or the server sent no version at all) -- see
+// that function's matching_major_version for the comparison itself.
+static bool g_api_version_mismatch = false;
 
 // ── State machine ─────────────────────────────────────────────────────────────
 
@@ -160,6 +266,105 @@ static void reset() {
     memset(&static_ip, 0, sizeof(static_ip));
     memset(&static_netmask, 0, sizeof(static_netmask));
     memset(&static_gw, 0, sizeof(static_gw));
+}
+
+// ── WiFi status snapshot for the display (see webui_data.h) ────────────────────
+// Global-scope (matches webui_data.h's declaration and the other Get*() accessors
+// above), reading the same local RM2 state the WiFi state machine maintains.
+
+// Formats a raw lwIP IPv4 address (host byte order per ip4_addr_t::addr, i.e.
+// octets little-end first, matching the WIFIDown-state IP print) into dotted
+// decimal.
+static void FormatIp4(uint32_t addr, char *buf, size_t bufSize)
+{
+    snprintf(buf, bufSize, "%lu.%lu.%lu.%lu",
+             (unsigned long)(addr & 0xFF), (unsigned long)((addr >> 8) & 0xFF),
+             (unsigned long)((addr >> 16) & 0xFF), (unsigned long)(addr >> 24));
+}
+
+// Maps a cyw43 tcpip link-status code to a short human-readable phrase for the
+// WiFi screen's connecting / connection-error lines.
+static const char *WiFiLinkStatusMessage(int link_status)
+{
+    switch (link_status) {
+        case CYW43_LINK_DOWN:    return "Link down";
+        case CYW43_LINK_JOIN:    return "Joining network";
+        case CYW43_LINK_NOIP:    return "Waiting for IP";
+        case CYW43_LINK_UP:      return "Connected";
+        case CYW43_LINK_FAIL:    return "Connection failed";
+        case CYW43_LINK_NONET:   return "Network not found";
+        case CYW43_LINK_BADAUTH: return "Wrong password";
+        default:                 return "Connecting";
+    }
+}
+
+void GetWiFiStatus(WiFiStatusInfo *out)
+{
+    if (out == nullptr)
+        return;
+
+    *out = WiFiStatusInfo{};
+
+    extern cyw43_t cyw43_state;
+
+    // The MAC belongs to the radio itself, so it's available (and worth showing
+    // on the error screen) even when there is no association.
+    uint8_t mac[6] = {0};
+    if (cyw43_wifi_get_mac(&cyw43_state, CYW43_ITF_STA, mac) == 0) {
+        snprintf(out->mac, sizeof(out->mac), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    }
+
+    // No SSID configured at all -- the host sent none and none was compiled in.
+    if (wifiSSID.empty()) {
+        out->state = WiFiStatusInfo::State::NoSSID;
+        return;
+    }
+
+    strncpy(out->ssid, wifiSSID.c_str(), sizeof(out->ssid) - 1);
+
+    int link_status = cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA);
+
+    // A link that's up (has an IP) is "connected" for display purposes -- show
+    // the signal strength / IP straight away, rather than gating on the state
+    // machine also reaching State::Normal (which lagged the link coming up by a
+    // few iterations and left the screen briefly reading "Connecting...").
+    if (link_status == CYW43_LINK_UP) {
+        out->state = WiFiStatusInfo::State::Connected;
+
+        // Read IP / netmask / gateway straight off the STA netif (authoritative
+        // for both DHCP and static-IP configs, and the only source for the
+        // netmask/gateway the details page shows).
+        struct netif *nif = &cyw43_state.netif[CYW43_ITF_STA];
+        FormatIp4(nif->ip_addr.addr, out->ip, sizeof(out->ip));
+        FormatIp4(nif->netmask.addr, out->netmask, sizeof(out->netmask));
+        FormatIp4(nif->gw.addr, out->gateway, sizeof(out->gateway));
+
+        int32_t rssi = 0;
+        if (cyw43_wifi_get_rssi(&cyw43_state, &rssi) == 0)
+            out->rssi = rssi;
+    } else if (link_status < 0) {
+        // Negative codes are hard association failures (fail / no-net / bad-auth).
+        out->state = WiFiStatusInfo::State::Error;
+        out->error = WiFiLinkStatusMessage(link_status);
+    } else {
+        // Non-negative but not up yet: the link is still coming up.
+        out->state = WiFiStatusInfo::State::Connecting;
+        out->error = WiFiLinkStatusMessage(link_status);
+    }
+}
+
+void RequestWiFiReconnect()
+{
+    // Stop the current connection first, then start a fresh one: disassociate
+    // from the network, then re-enter WIFIInit (which re-runs sta setup + DHCP
+    // and reconnects -- the same restart the host's I2C_SERVER_WIFI_CONNECT
+    // triggers via ProcessWiFiConnect()). programState is only ever mutated on
+    // core0's main loop, which is also where the display runs, so this is a
+    // plain assignment.
+    extern cyw43_t cyw43_state;
+    cyw43_wifi_leave(&cyw43_state, CYW43_ITF_STA);
+    programState = State::WIFIInit;
 }
 
 // ── I2C callback implementations ─────────────────────────────────────────────
@@ -229,28 +434,34 @@ void ProcessServerAPIVersion(const uint8_t *message, size_t length)
 
         // Parse device name from after the first space
         const char *space = (const char *)memchr(message, ' ', length);
+        serverAPIVersionOnly = (space != NULL)
+            ? std::string((const char*)message, (size_t)(space - (const char*)message))
+            : serverAPIVersion;
         if (space != NULL && (space + 1) < ((const char*)message + length)) {
             const char *parsed_name = space + 1;
             size_t name_len = length - (size_t)(parsed_name - (const char*)message);
             if (name_len >= 7 && strncmp(parsed_name, "ZuluSCSI", 8) == 0) {
                 device_name = "ZuluSCSI";
-                g_device_type = DeviceType::ZuluSCSI;
+                g_device_type = zulucontrol::config::DeviceType::ZuluSCSI;
                 printf("Detected device: ZuluSCSI\n");
             } else if (name_len >= 7 && strncmp(parsed_name, "ZuluIDE", 7) == 0) {
                 device_name = "ZuluIDE";
-                g_device_type = DeviceType::ZuluIDE;
+                g_device_type = zulucontrol::config::DeviceType::ZuluIDE;
                 printf("Detected device: ZuluIDE\n");
             }
         } else {
             // No device name - old firmware, assume ZuluIDE
-            g_device_type = DeviceType::ZuluIDE;
+            g_device_type = zulucontrol::config::DeviceType::ZuluIDE;
             printf("No device name in version string, assuming ZuluIDE\n");
         }
     } else {
         strcat(versionJson, ", \"serverAPIVersion\":\"Unknown\"");
         printf("Error: no API version received from server\n");
-        g_device_type = DeviceType::ZuluIDE;
+        g_device_type = zulucontrol::config::DeviceType::ZuluIDE;
+        serverAPIVersionOnly.clear();
     }
+
+    g_api_version_mismatch = !matching_major_version;
 
     strcat(versionJson, ", \"deviceType\":\"");
     strcat(versionJson, device_name);
@@ -258,13 +469,13 @@ void ProcessServerAPIVersion(const uint8_t *message, size_t length)
 
     if (!matching_major_version) {
         strcat(versionJson, ", \"message\":\"API major version mismatch. Please update both devices to the latest firmware. "
-            "<br/> <a href='https://github.com/ZuluIDE/ZuluIDE-HTTP-PicoW/releases'>ZuluControl firmware</a>\"");
+            "<br/> <a href='https://github.com/rabbitholecomputing/ZuluControl-firmware/releases'>ZuluControl-firmware downloads</a>\"");
         printf("Warning: major versions between client and server do not match. Please upgrade both devices.\n");
     }
 
     strcat(versionJson, "}");
     EnqueueRequest(I2C_CLIENT_RESET_QUEUE);
-    if (g_device_type == DeviceType::ZuluSCSI) {
+    if (g_device_type == zulucontrol::config::DeviceType::ZuluSCSI) {
         EnqueueRequest(I2C_CLIENT_API_VERSION, I2C_API_VERSION);
     }
     programState = State::WaitingForSSID;
@@ -280,12 +491,13 @@ void ProcessSystemStatus(const uint8_t *message, size_t length)
 {
     memset(currentStatus, 0, MAX_MSG_SIZE);
     memcpy(currentStatus, message, length < MAX_MSG_SIZE ? length : MAX_MSG_SIZE - 1);
+    g_status_received = true;
 }
 
 void ProcessUpdateFilenames(const uint8_t *message, size_t length)
 {
     uint8_t incoming_id = 0;  // ZuluIDE always uses slot 0
-    if (g_device_type == DeviceType::ZuluSCSI) {
+    if (g_device_type == zulucontrol::config::DeviceType::ZuluSCSI) {
         incoming_id = (length > 0) ? message[0] : 0xFF;
         if (incoming_id >= MAX_SCSI_IDS) {
             printf("Ignoring filename cache update for invalid SCSI ID %u\n", incoming_id);
@@ -307,11 +519,24 @@ void ProcessUpdateFilenames(const uint8_t *message, size_t length)
         g_filenames_write_ptr = filenames_json;
         g_filenames_overflow = false;
     }
+    else if (g_device_type != zulucontrol::config::DeviceType::ZuluSCSI) {
+        // ZuluIDE only ever occupies slot 0, so there is no other ID's segment
+        // to preserve and a re-fetch can rewind the whole buffer -- which it
+        // MUST: the write pointer only ever moves forward, so without this each
+        // refresh appended another complete copy of the same list, growing the
+        // cache until it overflowed and stranding the display's filename index
+        // (see the ZuluIDE branch of cgi_handler_filenames, which re-requests
+        // on every call once the cache is Full).
+        memset(filenames_json, 0, sizeof(filenames_json));
+        g_filenames_scsi_id[0] = nullptr;
+        g_filenames_write_ptr = filenames_json;
+    }
 
     printf("Beginning filename cache update for %s ID %u\n",
-           g_device_type == DeviceType::ZuluSCSI ? "SCSI" : "IDE", incoming_id);
+           g_device_type == zulucontrol::config::DeviceType::ZuluSCSI ? "SCSI" : "IDE", incoming_id);
     g_filenames_active_id = incoming_id;
     g_filenames_id_start   = g_filenames_write_ptr;
+    g_filenames_bytes_received = 0;
     filenameState = FilenameCacheState::Start;
 }
 
@@ -320,7 +545,7 @@ void ProcessFilename(const uint8_t *message, size_t length)
     const uint8_t *data = message;
     size_t data_len = length;
 
-    if (g_device_type == DeviceType::ZuluSCSI) {
+    if (g_device_type == zulucontrol::config::DeviceType::ZuluSCSI) {
         if (length == 0) {
             // fall through - end sentinel for the active ID
         } else {
@@ -338,6 +563,7 @@ void ProcessFilename(const uint8_t *message, size_t length)
 
     char *buf_end = filenames_json + FILENAMES_JSON_CACHE_SIZE;
     printf("Process filename length: %zu\n", data_len);
+    g_filenames_bytes_received += data_len;
 
     // Write the opening JSON header on the first call for this ID.
     if (filenameState == FilenameCacheState::Start) {
@@ -385,7 +611,7 @@ void ProcessFilename(const uint8_t *message, size_t length)
 
             g_filenames_scsi_id[g_filenames_active_id] = g_filenames_id_start;
 
-            if (g_device_type == DeviceType::ZuluSCSI) {
+            if (g_device_type == zulucontrol::config::DeviceType::ZuluSCSI) {
                 printf("Cached filenames for SCSI ID %u\n", g_filenames_active_id);
                 g_filenames_active_id = 0xFF;
                 filenameState = FilenameCacheState::Idle;
@@ -402,7 +628,7 @@ void ProcessImage(const uint8_t *message, size_t length)
     const uint8_t *data = message;
     size_t data_len = length;
 
-    if (g_device_type == DeviceType::ZuluSCSI && length > 0) {
+    if (g_device_type == zulucontrol::config::DeviceType::ZuluSCSI && length > 0) {
         // ZuluSCSI payload: [scsi_id][json...]; end sentinel is just [scsi_id] (data_len==0)
         data = message + 1;
         data_len = length - 1;
@@ -500,8 +726,25 @@ void ProcessDeviceList(const uint8_t *message, size_t length)
 void ProcessSDStatus(const uint8_t *message, size_t length)
 {
     if (length < 1) return;
-    g_sd_present = (message[0] == I2C_SERVER_SD_PRESENT);
-    printf("SD card %s\n", g_sd_present ? "present" : "not present");
+    bool present = (message[0] == I2C_SERVER_SD_PRESENT);
+    printf("SD card %s\n", present ? "present" : "not present");
+
+    // Either transition invalidates the cache, so drop it along with the usage
+    // it accounts for. On removal the cached filenames describe files that are
+    // no longer reachable -- the web UI and control panel would keep offering
+    // images that can't be loaded, and the Usage screen would keep reporting a
+    // full cache for a card that isn't there. On insertion they describe the
+    // *previous* card, which is just as wrong, and nothing else forces a
+    // refetch. Either way the next /filenames request refills it from the new
+    // card, and the display's filename index follows on its next
+    // DisplayData::Refresh(), which notices every id's JSON changed.
+    if (g_sd_present != present)
+    {
+        printf("Clearing filename cache after SD card %s\n", present ? "insertion" : "removal");
+        ClearFilenamesCache();
+    }
+
+    g_sd_present = present;
 }
 
 void ProcessUpgradeFirmwareRequest(const uint8_t* message, size_t length) {
@@ -524,7 +767,7 @@ void ProcessUpgradeFirmwareRequest(const uint8_t* message, size_t length) {
          break;
       case I2C_SERVER_FW_UPGRADE_ABORT:
          printf("Firmware upgrade request received: ABORT\n");
-         fwupgrade_i2c_begin();
+         fwupgrade_i2c_abort();
          programState = State::WaitForAPIVersion;
          break;
       case I2C_SERVER_FW_UPGRADE_RETRY:
@@ -588,6 +831,9 @@ void ProcessUpgradeFirmwareData(const uint8_t* message, size_t length) {
 
 }  // namespace zuluide::i2c::client
 
+bool IsApiVersionMismatch() { return g_api_version_mismatch; }
+const char *GetServerAPIVersionOnly() { return serverAPIVersionOnly.c_str(); }
+
 // ── CGI handlers ─────────────────────────────────────────────────────────────
 
 static const char *cgi_handler_version(int index, int numParams, char *pcParam[], char *pcValue[]) {
@@ -601,7 +847,7 @@ static const char *cgi_handler_status(int index, int numParams, char *pcParam[],
 static const char *cgi_handler_filenames(int index, int numParams, char *pcParam[], char *pcValue[]) {
     printf("Filenames CGI requested\n");
 
-    if (g_device_type == DeviceType::ZuluSCSI) {
+    if (g_device_type == zulucontrol::config::DeviceType::ZuluSCSI) {
         uint8_t req_id = 0;
         for (int i = 0; i < numParams; i++) {
             if (strncmp(pcParam[i], "scsiId", 7) == 0) {
@@ -645,6 +891,11 @@ static const char *cgi_handler_filenames(int index, int numParams, char *pcParam
             if (!zuluide::i2c::client::EnqueueRequest(I2C_CLIENT_FETCH_FILENAMES)) {
                 printf("Failed to add fetch filenames to output queue.\n");
             }
+        // Overflow is deliberately NOT re-requested here (unlike the ZuluSCSI
+        // branch above): it falls through to the "/overflow.json" return below,
+        // which is what steers the client onto the nextImage iterator for a list
+        // too big to cache. ProcessSDStatus's ClearFilenamesCache() is what
+        // takes the state back to Idle when the card next changes.
         } else if (filenameState == FilenameCacheState::Idle) {
             if (!zuluide::i2c::client::EnqueueRequest(I2C_CLIENT_FETCH_FILENAMES)) {
                 printf("Failed to add fetch filenames to output queue.\n");
@@ -663,7 +914,7 @@ static const char *cgi_handler_filenames(int index, int numParams, char *pcParam
 }
 
 static const char *cgi_handler_imgs(int index, int numParams, char *pcParam[], char *pcValue[]) {
-    if (g_device_type == DeviceType::ZuluSCSI) {
+    if (g_device_type == zulucontrol::config::DeviceType::ZuluSCSI) {
         uint8_t scsi_id = 0;
         for (int i = 0; i < numParams; i++) {
             if (strncmp(pcParam[i], "scsiId", 7) == 0) {
@@ -701,7 +952,7 @@ static const char *cgi_handler_next_image(int index, int numParams, char *pcPara
     }
 
     if (imageState == ImageCacheState::Idle) {
-        if (g_device_type == DeviceType::ZuluSCSI) {
+        if (g_device_type == zulucontrol::config::DeviceType::ZuluSCSI) {
             uint8_t payload[1] = {scsi_id};
             if (!zuluide::i2c::client::EnqueueRequestBinary(I2C_CLIENT_FETCH_ITR_IMAGE, payload, 1)) {
                 printf("Failed to add iterate image to output queue.\n");
@@ -717,7 +968,7 @@ static const char *cgi_handler_next_image(int index, int numParams, char *pcPara
         if (queue_is_empty(&imageQueue)) {
             return "/wait.json";
         } else {
-            if (g_device_type == DeviceType::ZuluSCSI) {
+            if (g_device_type == zulucontrol::config::DeviceType::ZuluSCSI) {
                 uint8_t payload[1] = {scsi_id};
                 if (!zuluide::i2c::client::EnqueueRequestBinary(I2C_CLIENT_FETCH_ITR_IMAGE, payload, 1)) {
                     printf("Failed to add iterate image to output queue.\n");
@@ -750,7 +1001,7 @@ static const char *cgi_handler_image(int index, int numParams, char *params[], c
 
     if (image_name == NULL) return "/error.json";
 
-    if (g_device_type == DeviceType::ZuluSCSI) {
+    if (g_device_type == zulucontrol::config::DeviceType::ZuluSCSI) {
         // Prepend scsi_id byte before the path
         size_t path_len = strlen(image_name);
         uint8_t *payload = new uint8_t[1 + path_len];
@@ -767,7 +1018,7 @@ static const char *cgi_handler_image(int index, int numParams, char *params[], c
 }
 
 static const char *cgi_handler_eject(int index, int numParams, char *params[], char *values[]) {
-    if (g_device_type == DeviceType::ZuluSCSI) {
+    if (g_device_type == zulucontrol::config::DeviceType::ZuluSCSI) {
         uint8_t scsi_id = 0;
         for (int i = 0; i < numParams; i++) {
             if (strncmp(params[i], "scsiId", 7) == 0) {
@@ -801,6 +1052,12 @@ static const char *cgi_handler_device_list(int index, int numParams, char *param
     return "/devicelist.json";
 }
 
+static const char *cgi_handler_usage(int index, int numParams, char *params[], char *values[]) {
+    // Nothing to request from the device -- both figures are local to this
+    // board and are built on demand in fs_open_custom().
+    return "/usage.json";
+}
+
 static const tCGI cgi_handlers[] = {
     {"/version",     cgi_handler_version},
     {"/status",      cgi_handler_status},
@@ -811,6 +1068,7 @@ static const tCGI cgi_handlers[] = {
     {"/nextImage",   cgi_handler_next_image},
     {"/insertMedia", cgi_handler_insert_media},
     {"/deviceList",  cgi_handler_device_list},
+    {"/usage",       cgi_handler_usage}
 };
 
 // ── POST handlers (firmware upgrade) ─────────────────────────────────────────
@@ -849,6 +1107,79 @@ void httpd_post_finished(void *connection, char *response_uri, u16_t response_ur
     g_httpd_post_finished_handler     = nullptr;
 }
 
+// ── HTTP server (re)start ─────────────────────────────────────────────────────
+
+// lwIP's httpd exposes no teardown entry point, so to genuinely restart the
+// server after a WiFi reconnect we free every PCB still holding
+// HTTPD_SERVER_PORT and abort any HTTP connections left half-open by the drop,
+// then re-run httpd_init(). Walking the raw PCB lists is the accepted workaround
+// for httpd's missing stop function; the small altcp listen wrapper leaked by
+// tcp_close() is negligible next to the once-per-reconnect frequency here.
+//
+// SO_REUSE is off in lwipopts.h, so httpd_init()'s tcp_bind() rejects the port
+// (LWIP_ASSERT -> panic "httpd_init: tcp_bind failed") if *any* PCB on *any*
+// list still has it -- including a browser connection that closed cleanly and
+// is sitting in TIME_WAIT. So all four lists have to be cleared here, not just
+// the listener and active connections.
+//
+// All lwIP PCB access, including httpd_init()'s own tcp_new/tcp_bind, must
+// happen under the cyw43 lock -- so it's held across the whole restart.
+static void restart_http_server() {
+    cyw43_arch_lwip_begin();
+
+    // Close the listening socket(s) on the HTTP port.
+    struct tcp_pcb_listen *lpcb = tcp_listen_pcbs.listen_pcbs;
+    while (lpcb != NULL) {
+        struct tcp_pcb_listen *next = lpcb->next;
+        if (lpcb->local_port == HTTPD_SERVER_PORT) {
+            tcp_close((struct tcp_pcb *)lpcb);
+        }
+        lpcb = next;
+    }
+
+    // Abort HTTP connections stranded by the disconnect so they release their
+    // pool slots (httpd frees the associated http_state via its err callback)
+    // and, crucially, free the port before the re-bind below.
+    struct tcp_pcb *pcb = tcp_active_pcbs;
+    while (pcb != NULL) {
+        struct tcp_pcb *next = pcb->next;
+        if (pcb->local_port == HTTPD_SERVER_PORT) {
+            tcp_abort(pcb);
+        }
+        pcb = next;
+    }
+
+    // Drop any TIME_WAIT PCBs on the port -- these linger for 2*MSL after a
+    // normal close (e.g. the browser tab that was open when the link dropped)
+    // and, with SO_REUSE off, are enough on their own to fail the re-bind.
+    // tcp_abort() removes a TIME_WAIT PCB from tcp_tw_pcbs and frees it.
+    pcb = tcp_tw_pcbs;
+    while (pcb != NULL) {
+        struct tcp_pcb *next = pcb->next;
+        if (pcb->local_port == HTTPD_SERVER_PORT) {
+            tcp_abort(pcb);
+        }
+        pcb = next;
+    }
+
+    // And any PCB bound-but-not-yet-listening on the port, for completeness.
+    pcb = tcp_bound_pcbs;
+    while (pcb != NULL) {
+        struct tcp_pcb *next = pcb->next;
+        if (pcb->local_port == HTTPD_SERVER_PORT) {
+            tcp_close(pcb);
+        }
+        pcb = next;
+    }
+
+    httpd_init();
+    http_set_cgi_handlers(cgi_handlers, sizeof(cgi_handlers) / sizeof(cgi_handlers[0]));
+
+    cyw43_arch_lwip_end();
+
+    zuluide::i2c::client::LogMessageToServer(ClientMessage::Type::Debug, "Http server restarted after WiFi reconnect.");
+}
+
 // ── Core 1 (I2C slave) ────────────────────────────────────────────────────────
 
 void core1_main() {
@@ -863,6 +1194,34 @@ void core1_main() {
 
 static bool has_elapsed(uint32_t start, uint32_t elapsed) {
     return (uint32_t)(millis() - start) > elapsed;
+}
+
+// ── USB console banner ────────────────────────────────────────────────────────
+
+// Prints our firmware and I2C API versions to the USB console every time a host
+// opens the CDC port.  The versions are already printed at boot, but nothing is
+// listening then -- the host normally attaches long afterwards -- so we repeat
+// them on each new connection.  The banner is delayed slightly after the
+// connection is detected because some host terminals drop bytes sent
+// immediately on open (see PICO_STDIO_USB_POST_CONNECT_WAIT_DELAY_MS).
+static void usb_console_task() {
+    static bool was_connected = false;
+    static bool banner_pending = false;
+    static uint32_t connected_time = 0;
+
+    bool connected = stdio_usb_connected();
+
+    if (connected != was_connected) {
+        was_connected = connected;
+        banner_pending = connected;
+        connected_time = millis();
+    }
+
+    if (banner_pending && has_elapsed(connected_time, PICO_STDIO_USB_POST_CONNECT_WAIT_DELAY_MS)) {
+        banner_pending = false;
+        printf("ZuluControl firmware version: %s\n", FW_VERSION);
+        printf("ZuluControl I2C API version: v%s\n", I2C_API_VERSION);
+    }
 }
 
 void start_multicore_i2c() {
@@ -891,6 +1250,8 @@ int main() {
 
     stdio_init_all();
     printf("Starting.\n");
+    printf("ZuluControl firmware version: %s\n", FW_VERSION);
+    printf("ZuluControl I2C API version: v%s\n", I2C_API_VERSION);
 
     memset(currentStatus, 0, MAX_MSG_SIZE);
     memset(versionJson, '\0', MAX_MSG_SIZE);
@@ -900,6 +1261,10 @@ int main() {
     queue_init(&imageQueue, sizeof(char *), 1);
 
     start_multicore_i2c();
+
+    if (!zuluide::display::InitDisplayControl()) {
+        printf("Display/control panel not found on i2c1 -- continuing without it.\n");
+    }
 
     if (cyw43_arch_init()) {
         LogMessageToServer(ClientMessage::Type::Normal, "Failed to initialize WiFi interface. WiFi client halting.");
@@ -916,6 +1281,9 @@ int main() {
     State last_state = State::Unknown;
 
     while (true) {
+        usb_console_task();
+        zuluide::display::DisplayControlTask();
+
         // Startup blink
         if (started_blink) {
             if ((uint32_t)(millis() - start_time) > 500) {
@@ -1048,6 +1416,10 @@ int main() {
                             http_set_cgi_handlers(cgi_handlers, sizeof(cgi_handlers) / sizeof(cgi_handlers[0]));
                             LogMessageToServer(ClientMessage::Type::Debug, "Http server initialized.");
                             httpInitialized = true;
+                        } else {
+                            // WiFi reconnected: restart the web server so it drops
+                            // stale connections and re-listens on the fresh link.
+                            restart_http_server();
                         }
 
                         cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, 1);
@@ -1207,6 +1579,21 @@ int fs_open_custom(struct fs_file *file, const char *name) {
         return get_file_contents(file, versionJson, strlen(versionJson));
     } else if (strncmp(name, "/devicelist.json", sizeof("/devicelist.json")) == 0) {
         return get_file_contents(file, deviceListJson, strlen(deviceListJson));
+    } else if (strncmp(name, "/usage.json", sizeof("/usage.json")) == 0) {
+        // "done" is false while a filenames fetch is still streaming in -- the
+        // figures below are then a snapshot of a cache that is still filling
+        // and will keep changing; true once nothing is in flight and they have
+        // settled, which is the web UI's cue to stop polling.
+        static char usageBuf[192];
+        snprintf(usageBuf, sizeof(usageBuf),
+                 "{\"done\":%s,"
+                 "\"filenameCache\":{\"bytesUsed\":%zu,\"bytesTotal\":%u},"
+                 "\"filenameIndex\":{\"imagesUsed\":%d,\"imagesTotal\":%d}}",
+                 IsFilenamesFetchActive() ? "false" : "true",
+                 GetFilenamesCacheBytesUsed(), (unsigned)FILENAMES_JSON_CACHE_SIZE,
+                 zuluide::display::GetFilenameIndexUsed(),
+                 zuluide::display::GetFilenameIndexCapacity());
+        return get_file_contents(file, usageBuf, strlen(usageBuf));
     } else {
         printf("Unable to find %s\n", name);
         return 0;

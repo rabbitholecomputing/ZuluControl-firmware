@@ -34,6 +34,32 @@ target_sources(zulucontrol PRIVATE
     src/url_decode.cpp
     src/ZuluControlI2CClient.cpp
     src/fw_upgrade.cpp
+    src/display/framebuffer.cpp
+    src/display/i2c_master_dma.cpp
+    src/display/ssd1306.cpp
+    src/display/gpio_expander.cpp
+    src/display/json_extract.cpp
+    src/display/display_data.cpp
+    src/display/screen.cpp
+    src/display/screen_registry.cpp
+    src/display/splash_screen.cpp
+    src/display/settings_screen.cpp
+    src/display/info_screen.cpp
+    src/display/message_box.cpp
+    src/display/main_screen.cpp
+    src/display/browse_screen.cpp
+    src/display/ui_settings.cpp
+    src/display/popup_menu.cpp
+    src/display/menu_screen.cpp
+    src/display/ide_main_screen.cpp
+    src/display/ide_browse_screen.cpp
+    src/display/ide_settings_screen.cpp
+    src/display/wifi_screen.cpp
+    src/display/usage_screen.cpp
+    src/display/about_screen.cpp
+    src/display/firmware_upgrade_screen.cpp
+    src/display/screen_saver.cpp
+    src/display/display_task.cpp
 )
 
 #pico_enable_stdio_uart(zulucontrol ENABLED)
@@ -49,6 +75,7 @@ target_link_options(zulucontrol PRIVATE "-Wl,--print-memory-usage")
 
 target_include_directories(zulucontrol PRIVATE
         ${CMAKE_CURRENT_LIST_DIR}/src
+        ${CMAKE_CURRENT_BINARY_DIR}/generated
         )
 
 set(RESOURCE_FILES
@@ -71,7 +98,7 @@ endforeach()
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${RESOURCE_FILES})
 configure_file(
     ${CMAKE_CURRENT_LIST_DIR}/src/index_html.in
-    ${CMAKE_CURRENT_LIST_DIR}/src/index_html.h
+    ${CMAKE_CURRENT_BINARY_DIR}/generated/index_html.h
     @ONLY
 )
 
@@ -102,4 +129,6 @@ target_link_libraries(zulucontrol
         pico_lwip_http
         boot_uf2_headers
         pico_cyw43_arch_lwip_threadsafe_background
+        hardware_i2c
+        hardware_dma
 )

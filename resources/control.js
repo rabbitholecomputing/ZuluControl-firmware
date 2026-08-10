@@ -3,9 +3,13 @@ var g_deviceType = 'Unknown';
 var g_scsiSelectId = -1;
 var g_scsiSelectType = '';
 var g_iterImgs = [];
+var g_scsiSlimSelect;
+var g_ideSlimSelect;
+var g_sdPresent = true;
+var g_sdSeen = false;
+var usageTimer;
+var USAGE_POLL_MS = 250;
 
-// Restore saved refresh settings once DOM is ready.
-// load_version() (defined below) is invoked by version.js DOMContentLoaded listener.
 document.addEventListener('DOMContentLoaded', function() {
   if (typeof(Storage) !== 'undefined') {
     var rt = localStorage.getItem('refreshTime');
@@ -19,23 +23,42 @@ document.addEventListener('DOMContentLoaded', function() {
     slimSelectScript.src = 'slimselect.js'; 
     slimSelectScript.async = true;
     slimSelectScript.onload = function() {
-      new SlimSelect({
-        select: '#ide-newImg'});
-      new SlimSelect({
-        select: '#scsi-newImg'});
+      g_ideSlimSelect = new SlimSelect({
+        select: '#ide-newImg',
+        settings: {
+          disabled: true,
+          placeholderText: "Loading..."
+        }
+      });
+      g_scsiSlimSelect = new SlimSelect({
+        select: '#scsi-newImg',
+        settings: {
+          disabled: true,
+          placeholderText: "Loading..."
+        }
+      });
     }
     document.head.appendChild(slimSelectScript);
   }
   else
   {
-    new SlimSelect({
-      select: '#ide-newImg'});
-    new SlimSelect({
-      select: '#scsi-newImg'});
+    g_ideSlimSelect = new SlimSelect({
+      select: '#ide-newImg',
+      settings: {
+        disabled: true,
+        placeholderText: "Loading..."
+      }
+    });
+    g_scsiSlimSelect = new SlimSelect({
+      select: '#scsi-newImg',
+      settings: {
+        disabled: true,
+        placeholderText: "Loading..."
+      }
+    })
   }
 });
 
-// Override the load_version defined in version.js so we can show the right view.
 function load_version() {
   fetch('version')
     .then(function(r) { return r.json(); })
@@ -48,28 +71,134 @@ function load_version() {
     });
 }
 
+function hideElementById(elem_id) {
+  document.getElementById(elem_id).classList.add('hdn');
+}
+
+function showElementById(elem_id) {
+  document.getElementById(elem_id).classList.remove('hdn');
+}
+
+function isElementShown(elem_id) {
+  var elm = document.getElementById(elem_id);
+  return !!elm && !elm.classList.contains('hdn');
+}
+
 function showView(devType) {
-  document.getElementById('ctrl-row').removeAttribute('class');
-  document.getElementById('version').removeAttribute('class');
+  showElementById('ctrl-row');
+  showElementById('version');
   if (devType === 'ZuluSCSI') {
-    document.getElementById('scsi-view').removeAttribute('class');
+    showElementById('scsi-view');
   } else {
-    document.getElementById('ide-view').removeAttribute('class');
+    showElementById('ide-view');
   }
 }
 
 function refresh() {
   fetch('status')
     .then(function(r) { return r.json(); })
-    .then(function(status) { updateStatus(status); });
+    .then(function(status) { updateStatus(status); })
+    .catch(function(err) { console.error('Status fetch failed: ' + err); });
+}
+
+function formatBytes(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  return (bytes / 1024).toFixed(1) + ' kB';
+}
+
+function percentOf(used, total) {
+  if (!total) return '';
+  return ' (' + Math.round((used * 100) / total) + '%)';
+}
+
+function loadUsage() {
+  clearTimeout(usageTimer);
+  fetch('usage')
+    .then(function(r) { return r.json(); })
+    .then(function(usage) {
+      updateUsage(usage);
+      if (usage.done)
+      {
+        hideElementById('ufc-loading');
+        if (g_deviceType === 'ZuluIDE')
+        {
+          ideLoadFns();
+        }
+        else if (g_deviceType === 'ZuluSCSI')
+        {
+          if (isElementShown('scsi-si') && g_scsiSelectId >= 0)
+          {
+            scsiLoadFns(g_scsiSelectId);
+          }
+        }
+      }
+      else {
+        showElementById('ufc-loading');
+        usageTimer = setTimeout(loadUsage, USAGE_POLL_MS);
+      }
+    })
+    .catch(function(err) {
+      g_sdSeen = false;
+      console.error('Usage fetch failed: ' + err);
+      hideElementById('ufc-loading');
+      document.getElementById('ufc').innerHTML = 'unavailable';
+      document.getElementById('uci').innerHTML = 'unavailable';
+    });
+}
+
+function updateUsage(usage) {
+  var cache = usage.filenameCache || {};
+  var index = usage.filenameIndex || {};
+  var bytesUsed = cache.bytesUsed || 0;
+  var bytesTotal = cache.bytesTotal || 0;
+  var imgsUsed = index.imagesUsed || 0;
+  var imgsTotal = index.imagesTotal || 0;
+
+  document.getElementById('ufc').innerHTML =
+    formatBytes(bytesUsed) + ' of ' + formatBytes(bytesTotal) + percentOf(bytesUsed, bytesTotal);
+  document.getElementById('uci').innerHTML =
+    imgsUsed + ' of ' + imgsTotal + ' images' + percentOf(imgsUsed, imgsTotal);
 }
 
 function updateStatus(status) {
+  g_sdPresent = !!status.sdPresent;
+  if (!g_sdPresent) {
+    g_sdSeen = false;
+    clearTimeout(usageTimer);
+    clearImageLists();
+    hideElementById('ufc-loading');
+    document.getElementById('ufc').innerHTML = 'no SD card';
+    document.getElementById('uci').innerHTML = 'no SD card';
+  } else if (!g_sdSeen) {
+    g_sdSeen = true;
+    loadUsage();
+  }
+
   if (g_deviceType === 'ZuluSCSI') {
     scsiUpdateStatus(status);
   } else {
     ideUpdateStatus(status);
   }
+}
+
+// -- Image select list ---------------------------------------------------------
+function clearOptions(ni) {
+  if (ni) { while (ni.options.length) { ni.options.remove(0); } }
+}
+
+function clearImageList(selectId, loadBtnId, slimSelect) {
+  clearOptions(document.getElementById(selectId));
+  var btn = document.getElementById(loadBtnId);
+  if (btn) btn.disabled = true;
+  slimSelect && (slimSelect.disable());
+}
+
+// Both views' lists (only one is ever visible) plus the iterator buffer they
+// are built from.
+function clearImageLists() {
+  g_iterImgs = [];
+  clearImageList('ide-newImg', 'ide-si-load', g_ideSlimSelect);
+  clearImageList('scsi-newImg', 'scsi-si-load', g_scsiSlimSelect);
 }
 
 function autoRefresh() {
@@ -88,16 +217,34 @@ function autoRefresh() {
   }
 }
 
-// ── ZuluIDE ──────────────────────────────────────────────────────────────────
+// -- ZuluIDE  ------------------------------------------------------------------
+function ideMediaTypeLabel(image) {
+  if (image) {
+    var type = (image.type || '').toLowerCase();
+    if (type.indexOf('zip') === 0) return 'Zip Drive';
+    var name = (image.filename || '').toLowerCase();
+    var base = name.substring(name.lastIndexOf('/') + 1);
+    if (/^(zipdrive|zipd|z100|z250|z750)/.test(base)) return 'Zip Drive';
+  }
+  return 'CD-ROM';
+}
 
 function ideUpdateStatus(status) {
   var sdElm = document.getElementById('ide-sd');
   sdElm.innerHTML = status.sdPresent ? 'Present' : 'Not present';
   sdElm.style.color = status.sdPresent ? '' : 'red';
   var elm = document.getElementById('ide-dt');
-  elm.innerHTML = (status.isPrimary ? 'Primary' : 'Secondary') + ' CD-ROM';
+  elm.innerHTML = (status.isPrimary ? 'Primary' : 'Secondary') + ' ' + ideMediaTypeLabel(status.image);
   elm = document.getElementById('ide-img');
-  elm.innerHTML = status.image ? status.image.filename : '(no image)';
+  var imgName = status.image ? status.image.filename : '(no image)';
+  // isDeferred is serialized as the string "true"/"false" (the device writes
+  // toString(bool), not a JSON boolean), so compare against the string rather
+  // than testing truthiness -- the string "false" is itself truthy.
+  if (status.isDeferred === 'true') {
+    elm.innerHTML = imgName + '<br/>[Host deferred ejection]';
+  } else {
+    elm.innerHTML = imgName;
+  }
 }
 
 function ideEjectClk() {
@@ -110,22 +257,17 @@ function ideEjectClk() {
 }
 
 function ideSelectClk() {
-  var sdElm = document.getElementById('ide-sd');
-  if (sdElm) {
-    sdElm.innerHTML = status.sdPresent ? 'Present' : 'Not present';
-    sdElm.style.color = status.sdPresent ? '' : 'red';
+  hideElementById('ide-st');
+  showElementById('ide-si');
+  if (document.getElementById('ide-newImg').options.length === 0) {
+    g_iterImgs = [];
+    ideLoadFns();
   }
-  document.getElementById('ide-st').setAttribute('class', 'hdn');
-  document.getElementById('ide-si').removeAttribute('class');
-  var ni = document.getElementById('ide-newImg');
-  while (ni.options.length) { ni.options.remove(0); }
-  g_iterImgs = [];
-  ideLoadFns();
 }
 
 function ideCancelClicked() {
-  document.getElementById('ide-si').setAttribute('class', 'hdn');
-  document.getElementById('ide-st').removeAttribute('class');
+  hideElementById('ide-si');
+  showElementById('ide-st');
   setTimeout(refresh, 1500);
 }
 
@@ -138,38 +280,61 @@ function ideLoadClicked() {
 }
 
 function ideLoadFns() {
+  const selectFns = document.getElementById('ide-newImg');
   fetch('filenames')
     .then(function(r) { return r.json(); })
     .then(function(fns) {
-      if (fns.status === 'wait') { setTimeout(ideLoadFns, 50); }
-      else if (fns.status === 'overflow') { ideLoadImgIter(); }
-      else { ideWriteFn(document.getElementById('ide-newImg'), fns); }
-    });
+      if (fns.status === 'wait') {
+        document.getElementById('ide-si-load').disabled = true;
+        g_ideSlimSelect && (g_ideSlimSelect.disable());
+        setTimeout(ideLoadFns, 250);
+      }
+      // The iterator appends to g_iterImgs, so start each walk from empty.
+      else if (fns.status === 'overflow') { g_iterImgs = []; ideLoadImgIter(); }
+      else if (!g_sdPresent) { clearImageLists(); }
+      else {
+        ideWriteFn(selectFns, fns);
+        g_ideSlimSelect && (g_ideSlimSelect.enable());
+        document.getElementById('ide-si-load').disabled = false;
+      }
+    })
+    .catch(function(err) { console.error('Filenames fetch failed: ' + err); });
 }
 
 function ideLoadImgIter() {
   fetch('nextImage')
     .then(function(r) { return r.json(); })
     .then(function(img) {
-      if (img.status === 'wait') { setTimeout(ideLoadImgIter, 50); }
-      else if (img.status === 'done') { ideWriteImgs(document.getElementById('ide-newImg')); }
-      else { g_iterImgs.push(img); ideLoadImgIter(); }
+      if (img.status === 'wait') {
+        document.getElementById('ide-si-load').disabled = true;
+        g_ideSlimSelect && (g_ideSlimSelect.disable());
+        setTimeout(ideLoadImgIter, 250);
+      }
+      else if (img.status === 'done' && !g_sdPresent) { clearImageLists(); }
+      else if (img.status === 'done') {
+        ideWriteImgs(document.getElementById('ide-newImg'));
+        g_ideSlimSelect && (g_ideSlimSelect.enable());
+        document.getElementById('ide-si-load').disabled = false;
+      }
+      else { g_iterImgs.push(img); ideLoadImgIter();}
     });
 }
 
 function ideWriteFn(ni, fns) {
+  clearOptions(ni);
   for (var i = 0; i < fns.filenames.length; i++) {
     ni.add(new Option(fns.filenames[i]));
   }
 }
 
 function ideWriteImgs(ni) {
+  clearOptions(ni);
   for (var i = 0; i < g_iterImgs.length; i++) {
     ni.add(new Option(g_iterImgs[i].filename));
   }
 }
 
-// ── ZuluSCSI ─────────────────────────────────────────────────────────────────
+// -- ZuluSCSI ------------------------------------------------------------------
 
 function scsiUpdateStatus(status) {
   var sdElm = document.getElementById('scsi-sd');
@@ -240,8 +405,8 @@ function scsiSelectClk(id, type) {
   g_scsiSelectId = id;
   g_scsiSelectType = type;
   g_iterImgs = [];
-  document.getElementById('scsi-devices').setAttribute('class', 'hdn');
-  document.getElementById('scsi-si').removeAttribute('class');
+  hideElementById('scsi-devices');
+  showElementById('scsi-si');
   document.getElementById('scsi-si-id').innerHTML = id;
   document.getElementById('scsi-si-type').innerHTML = type;
   var ni = document.getElementById('scsi-newImg');
@@ -250,8 +415,8 @@ function scsiSelectClk(id, type) {
 }
 
 function scsiCancelClicked() {
-  document.getElementById('scsi-si').setAttribute('class', 'hdn');
-  document.getElementById('scsi-devices').removeAttribute('class');
+  hideElementById('scsi-si');
+  showElementById('scsi-devices');
   setTimeout(refresh, 1500);
 }
 
@@ -267,23 +432,48 @@ function scsiLoadFns(id) {
   fetch('filenames?' + new URLSearchParams({ scsiId: id }))
     .then(function(r) { return r.json(); })
     .then(function(fns) {
-      if (fns.status === 'wait') { setTimeout(function() { scsiLoadFns(id); }, 50); }
-      else if (fns.status === 'overflow') { scsiLoadImgIter(id); }
-      else { scsiWriteFn(document.getElementById('scsi-newImg'), fns); }
-    });
+      if (fns.status === 'wait') {
+        g_scsiSlimSelect && (g_scsiSlimSelect.disable());
+        document.getElementById('scsi-si-load').disabled = true;
+        setTimeout(function() { 
+          scsiLoadFns(id);
+        }, 250);
+      }
+      // The iterator appends to g_iterImgs, so start each walk from empty.
+      else if (fns.status === 'overflow') { g_iterImgs = []; scsiLoadImgIter(id); }
+      else if (!g_sdPresent) { clearImageLists(); }
+      else {
+        scsiWriteFn(document.getElementById('scsi-newImg'), fns);
+        g_scsiSlimSelect && (g_scsiSlimSelect.enable());
+        document.getElementById('scsi-si-load').disabled = false;
+      }
+    })
+    .catch(function(err) { console.error('Filenames fetch failed: ' + err); });
 }
 
 function scsiLoadImgIter(id) {
   fetch('nextImage?' + new URLSearchParams({ scsiId: id }))
     .then(function(r) { return r.json(); })
     .then(function(img) {
-      if (img.status === 'wait') { setTimeout(function() { scsiLoadImgIter(id); }, 50); }
-      else if (img.status === 'done') { scsiWriteImgs(document.getElementById('scsi-newImg')); }
-      else { g_iterImgs.push(img); scsiLoadImgIter(id); }
+      g_scsiSlimSelect && (g_scsiSlimSelect.disable());
+      document.getElementById('scsi-si-load').disabled = true;
+      if (img.status === 'wait') {
+        setTimeout(function() { 
+          scsiLoadImgIter(id);
+        }, 250);
+      }
+      else if (img.status === 'done' && !g_sdPresent) { clearImageLists(); }
+      else if (img.status === 'done') {
+        scsiWriteImgs(document.getElementById('scsi-newImg'));
+        g_scsiSlimSelect && (g_scsiSlimSelect.enable());
+        document.getElementById('scsi-si-load').disabled = false;
+      }
+      else { g_iterImgs.push(img); scsiLoadImgIter(id);}
     });
 }
 
 function scsiWriteFn(ni, fns) {
+  clearOptions(ni);
   const fnOptions = Array.from(fns.filenames);
   fnOptions.sort((a, b) => a.localeCompare(b)); // Sort filenames alphabetically
   for (var i = 0; i < fnOptions.length; i++) {
@@ -293,6 +483,7 @@ function scsiWriteFn(ni, fns) {
 
 function scsiWriteImgs(ni) {
   // Use path as option value (full path needed by controlLoadImage); filename as display text
+  clearOptions(ni);
   for (var i = 0; i < g_iterImgs.length; i++) {
     var img = g_iterImgs[i];
     ni.add(new Option(img.filename, img.path || img.filename));

@@ -21,6 +21,7 @@
 
 #include "fw_upgrade.h"
 #include "ZuluControlI2CClient.h"
+#include "display/display_task.h"  // PumpFirmwareUpgradeDisplay()
 #include <hardware/sync.h>
 #include <hardware/flash.h>
 #include <hardware/gpio.h>
@@ -64,7 +65,27 @@ static struct {
     uint32_t num_blocks;
     uint8_t staged[MAX_MSG_SIZE];
     size_t staged_len;
+    // Progress mirror for the control-panel display (see fwupgrade_get_status).
+    bool active;
+    bool via_http;
+    uint32_t retries;
+    uint32_t errors;
+    // Full-file (byte-based) progress, independent of the family-matching
+    // blocks_received/num_blocks used for flashing -- see FwUpgradeStatus.
+    uint64_t bytes_received;
+    uint64_t total_bytes;
 } g_fwup_state;
+
+void fwupgrade_get_status(FwUpgradeStatus *out)
+{
+    if (!out) return;
+    out->active = g_fwup_state.active;
+    out->via_http = g_fwup_state.via_http;
+    out->bytes_received = g_fwup_state.bytes_received;
+    out->total_bytes = g_fwup_state.total_bytes;
+    out->retries = g_fwup_state.retries;
+    out->errors = g_fwup_state.errors;
+}
 
 err_t fwupgrade_post_begin(void *connection, const char *uri, const char *http_request,
                        u16_t http_request_len, int content_len, char *response_uri,
@@ -74,6 +95,15 @@ err_t fwupgrade_post_begin(void *connection, const char *uri, const char *http_r
     g_fwup_state.block_size = 0;
     g_fwup_state.blocks_received = 0;
     g_fwup_state.num_blocks = 0;
+    g_fwup_state.active = true;
+    g_fwup_state.via_http = true;
+    g_fwup_state.retries = 0;
+    g_fwup_state.errors = 0;
+    g_fwup_state.bytes_received = 0;
+    // The web upload POSTs the raw .uf2 as the body, so Content-Length is the
+    // exact full-file size -- the whole universal image, both families. (<= 0
+    // means the length wasn't supplied; fall back to deriving it per-block.)
+    g_fwup_state.total_bytes = (content_len > 0) ? (uint64_t)content_len : 0;
     gpio_put(GPIO_MCU_LED, false);
     return ERR_OK;
 }
@@ -85,6 +115,26 @@ void fwupgrade_i2c_begin()
     g_fwup_state.blocks_received = 0;
     g_fwup_state.num_blocks = 0;
     g_fwup_state.staged_len = 0;
+    g_fwup_state.active = true;
+    g_fwup_state.via_http = false;
+    g_fwup_state.retries = 0;
+    g_fwup_state.errors = 0;
+    g_fwup_state.bytes_received = 0;
+    // No content length over I2C -- derive the total from the first UF2 block's
+    // num_blocks the first time we parse one (see handle_uf2_block).
+    g_fwup_state.total_bytes = 0;
+    gpio_put(GPIO_MCU_LED, false);
+}
+
+void fwupgrade_i2c_abort()
+{
+    g_fwup_state.block_size = 0;
+    g_fwup_state.blocks_received = 0;
+    g_fwup_state.num_blocks = 0;
+    g_fwup_state.staged_len = 0;
+    g_fwup_state.active = false;
+    g_fwup_state.bytes_received = 0;
+    g_fwup_state.total_bytes = 0;
     gpio_put(GPIO_MCU_LED, false);
 }
 
@@ -162,8 +212,21 @@ static bool handle_uf2_block(uf2_block *block, bool stop_second_core = true)
     {
         printf("UF2 magics do not match (0x%08lx 0x%08lx 0x%08lx)\n",
             block->magic_start0, block->magic_start1, block->magic_end);
+        g_fwup_state.errors++;
         return false;
     }
+
+    // The I2C path has no Content-Length, so the total file size is discovered
+    // from the UF2 stream itself. A universal image is several independently
+    // numbered family segments concatenated; each segment starts at block_no 0
+    // and declares its own num_blocks. Summing num_blocks at every block_no==0
+    // totals the WHOLE image, not just the first family -- otherwise the bar
+    // hits 100% at the first seam (~half the upload) and sticks there. Each UF2
+    // block is sizeof(uf2_block) bytes on the wire. (Retried chunks are
+    // discarded before commit, so a segment's block_no==0 is parsed only once.)
+    // The web path already has the exact size from Content-Length -- leave it be.
+    if (!g_fwup_state.via_http && block->block_no == 0 && block->num_blocks > 0)
+        g_fwup_state.total_bytes += (uint64_t)block->num_blocks * sizeof(uf2_block);
 
     static uint32_t s_last_family_block = UF2_FAMILY_ID;
     static uint8_t s_dot_count = 0;
@@ -208,6 +271,7 @@ static bool handle_uf2_block(uf2_block *block, bool stop_second_core = true)
     if (block->payload_size != UF2_PAYLOAD_SIZE)
     {
         printf("Unexpected payload size %lu\n", block->payload_size);
+        g_fwup_state.errors++;
         return false;
     }
 
@@ -215,6 +279,7 @@ static bool handle_uf2_block(uf2_block *block, bool stop_second_core = true)
         block->target_addr >= FW_UPGRADE_TARGET_ADDR + FW_UPGRADE_TEMP_OFFSET)
     {
         printf("UF2 block offset out of range: 0x%08lx\n", block->target_addr);
+        g_fwup_state.errors++;
         return false;
     }
 
@@ -234,6 +299,7 @@ static bool handle_uf2_block(uf2_block *block, bool stop_second_core = true)
     {
         printf("UF2 block out of order, got %lu expected %lu\n",
             block->block_no, g_fwup_state.blocks_received);
+        g_fwup_state.errors++;
         return false;
     }
 
@@ -254,6 +320,7 @@ static bool handle_uf2_block(uf2_block *block, bool stop_second_core = true)
     if (!program_ok)
     {
         printf("Programming UF2 block to temporary flash failed at addr %lu\n", tmp_addr);
+        g_fwup_state.errors++;
         return false;
     }
     g_fwup_state.blocks_received++;
@@ -278,6 +345,10 @@ err_t fwupgrade_post_receive_data(void *connection, struct pbuf *p)
 {
     uint8_t *first_byte = (uint8_t*)p->payload;
     printf("fwupgrade_post_receive_data %d 0x%02x 0x%02x\n", (int)p->tot_len, first_byte[0], first_byte[1]);
+
+    // Count the whole segment toward full-file upload progress (all families).
+    // The POST body is the raw .uf2, so this sums to Content-Length at the end.
+    g_fwup_state.bytes_received += p->tot_len;
 
     // Walk every segment in the pbuf chain — lwIP may deliver chained pbufs
     // after TCP retransmissions, and p->payload/p->len only covers the first segment.
@@ -309,6 +380,14 @@ err_t fwupgrade_post_receive_data(void *connection, struct pbuf *p)
     }
 
     pbuf_free(p);
+
+    // A web upload runs entirely in the lwIP background context, which starves
+    // core0's main loop -- so DisplayControlTask() can't advance the progress
+    // bar on its own. Drive it from here, once per received segment (the pump
+    // throttles itself), so the panel shows real progress instead of a frozen
+    // first frame. Harmless no-op if there's no display or no active upgrade.
+    zuluide::display::PumpFirmwareUpgradeDisplay();
+
     return ERR_OK;
 }
 
@@ -335,6 +414,11 @@ bool fwupgrade_i2c_commit_staged()
     const uint8_t *data = g_fwup_state.staged;
     size_t remain = g_fwup_state.staged_len;
     g_fwup_state.staged_len = 0;
+
+    // Committed (confirmed-good) chunk bytes count toward upload progress. Doing
+    // it here rather than at stage time means a chunk the host RETRYs (discarded
+    // before commit) isn't double-counted when it's resent.
+    g_fwup_state.bytes_received += remain;
 
     // Core1 (running the I2C slave ISR) is left running during the I2C upgrade
     // path so it can keep servicing the bus while we flash. Core1 executes from
@@ -381,6 +465,7 @@ bool fwupgrade_i2c_commit_staged()
 void fwupgrade_i2c_discard_staged()
 {
     g_fwup_state.staged_len = 0;
+    g_fwup_state.retries++;
 }
 void start_multicore_i2c();
 
@@ -392,6 +477,7 @@ void fwupgrade_post_finished(void *connection, char *response_uri, u16_t respons
         printf("fwupgrade interrupted, %lu/%lu blocks done\n",
             g_fwup_state.blocks_received, g_fwup_state.num_blocks);
         gpio_put(GPIO_MCU_LED, false);
+        g_fwup_state.active = false;
 
         if (g_fwup_state.num_blocks > 0)
         {
@@ -421,6 +507,7 @@ void fwupgrade_i2c_finished()
         printf("I2C firmware upgrade interrupted, %lu/%lu blocks done\n",
             g_fwup_state.blocks_received, g_fwup_state.num_blocks);
         gpio_put(GPIO_MCU_LED, false);
+        g_fwup_state.active = false;
 
         if (g_fwup_state.num_blocks > 0)
         {
