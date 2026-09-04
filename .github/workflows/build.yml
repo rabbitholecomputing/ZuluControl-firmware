@@ -2,6 +2,8 @@ name: Build ZuluControl-firmware
 
 on:
   push:
+    paths-ignore:
+      - README.md
 
 jobs:
   build:
