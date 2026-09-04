@@ -52,7 +52,7 @@ Normally the ZuluIDE or ZuluSCSI would be connected to a ZuluControl board desig
 
 After installing ZuluControl-firmware onto a Pico W/2W, the Pico must be connected to the ZuluIDE or ZuluSCSI via 3 wires. The following diagram shows which pins on the Pico W must be connected to the ZuluIDE. Additionally, you must power the Pico (e.g., via its USB port or any other methods described by the Raspberry PI Pico documentation).
 
-Lastly, be sure to restart the ZuluIDE or ZuluSCSI with the ZuluControl connected. ZuluIDE does not support hot plugging on the I2C connection used by the ZuluControl.
+Lastly, be sure to restart the ZuluIDE or ZuluSCSI with the ZuluControl connected. ZuluIDE and ZuluSCSI firmware does not support hot plugging on the I2C connection used by the ZuluControl.
 
 ![Wiring ZuluControl to ZuluIDE [^1] ](pico-pinout-zuluide.svg)
 ![Wiring ZuluControl to ZuluSCSI[^1] ](pico-pinout-zuluscsi.svg)
